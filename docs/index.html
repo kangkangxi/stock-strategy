@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>A股尾盘短线策略系统 · Tail Momentum</title>
+<meta name="description" content="围绕 14:30 强势股筛选、尾盘确认买入、次日冲高卖出构建的 A 股短线策略引擎。纯 Python 标准库，零第三方依赖。">
+<style>
+  :root{
+    --bg:#060a12;
+    --bg-soft:#0a111d;
+    --panel:rgba(15,23,36,.72);
+    --line:rgba(126,166,220,.14);
+    --line-strong:rgba(126,166,220,.28);
+    --text:#e8eefb;
+    --muted:#8fa1bb;
+    --muted-2:#6b7d96;
+    --green:#2ee6a8;
+    --green-soft:rgba(46,230,168,.12);
+    --blue:#62a8ff;
+    --red:#ff5c72;
+    --amber:#ffc857;
+    --radius:18px;
+    --mono:"JetBrains Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font-family:var(--sans);
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+    overflow-x:hidden;
+  }
+  a{color:inherit;text-decoration:none}
+  ::selection{background:rgba(46,230,168,.28);color:#fff}
+
+  /* ── 背景 ── */
+  .page-bg{position:fixed;inset:0;z-index:-2;background:
+    radial-gradient(900px 520px at 12% -8%, rgba(46,230,168,.13), transparent 60%),
+    radial-gradient(820px 480px at 88% 2%, rgba(98,168,255,.12), transparent 62%),
+    radial-gradient(700px 600px at 50% 108%, rgba(255,92,114,.06), transparent 65%),
+    var(--bg);}
+  .page-grid{position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;
+    background-image:linear-gradient(rgba(140,180,235,.045) 1px,transparent 1px),
+                     linear-gradient(90deg,rgba(140,180,235,.045) 1px,transparent 1px);
+    background-size:64px 64px;
+    mask-image:radial-gradient(circle at 50% 20%,#000 0%,transparent 78%);}
+
+  .wrap{width:min(1180px,calc(100% - 48px));margin:0 auto}
+
+  /* ── 顶栏 ── */
+  header{position:fixed;top:0;left:0;right:0;z-index:50;
+    backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+    background:rgba(6,10,18,.72);border-bottom:1px solid transparent;
+    transition:border-color .3s ease,background .3s ease}
+  header.scrolled{border-bottom-color:var(--line);background:rgba(6,10,18,.9)}
+  .nav{display:flex;align-items:center;justify-content:space-between;height:70px}
+  .brand{display:flex;align-items:center;gap:12px;font-weight:700;letter-spacing:.2px}
+  .brand-mark{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;
+    background:linear-gradient(145deg,rgba(46,230,168,.22),rgba(98,168,255,.12));
+    border:1px solid rgba(46,230,168,.35);box-shadow:0 0 24px rgba(46,230,168,.16)}
+  .brand small{display:block;font-size:10px;letter-spacing:.22em;color:var(--muted-2);font-weight:600}
+  .nav-links{display:flex;align-items:center;gap:28px;font-size:14px;color:var(--muted)}
+  .nav-links a{transition:color .2s}
+  .nav-links a:hover{color:var(--text)}
+  .nav-cta{display:flex;align-items:center;gap:12px}
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;
+    height:42px;padding:0 20px;border-radius:11px;font-size:14px;font-weight:600;
+    border:1px solid transparent;transition:transform .2s,box-shadow .2s,background .2s;white-space:nowrap}
+  .btn:hover{transform:translateY(-1px)}
+  .btn.primary{background:linear-gradient(120deg,var(--green),#56f0c4);color:#04140f;
+    box-shadow:0 10px 30px rgba(46,230,168,.22)}
+  .btn.primary:hover{box-shadow:0 14px 36px rgba(46,230,168,.32)}
+  .btn.ghost{background:rgba(255,255,255,.03);border-color:var(--line-strong);color:var(--text)}
+  .btn.ghost:hover{background:rgba(255,255,255,.06)}
+  .menu-btn{display:none;width:42px;height:42px;border-radius:10px;border:1px solid var(--line);
+    background:transparent;color:var(--text);cursor:pointer}
+
+  /* ── Hero ── */
+  .hero{position:relative;padding:150px 0 70px}
+  .hero-grid{display:grid;grid-template-columns:1.06fr .94fr;gap:56px;align-items:center}
+  .eyebrow{display:inline-flex;align-items:center;gap:10px;padding:7px 14px;border-radius:999px;
+    border:1px solid rgba(46,230,168,.26);background:rgba(46,230,168,.07);
+    color:#9ff3d6;font-size:11px;font-weight:700;letter-spacing:.16em;margin-bottom:24px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--green);
+    box-shadow:0 0 0 4px rgba(46,230,168,.14);animation:pulse 2.4s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  h1{font-size:clamp(42px,5.6vw,70px);line-height:1.12;letter-spacing:-.02em;font-weight:800}
+  .grad{background:linear-gradient(100deg,#8bf7d6 0%,var(--green) 34%,var(--blue) 100%);
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lead{margin-top:22px;font-size:17px;color:var(--muted);max-width:560px}
+  .hero-actions{display:flex;gap:14px;margin-top:34px;flex-wrap:wrap}
+  .hero-meta{display:flex;gap:22px;margin-top:30px;font-size:12.5px;color:var(--muted-2);
+    font-family:var(--mono);letter-spacing:.02em;flex-wrap:wrap}
+  .hero-meta span{display:flex;align-items:center;gap:8px}
+  .hero-meta span::before{content:"";width:5px;height:5px;border-radius:50%;background:var(--green);opacity:.7}
+
+  /* 报告卡片 */
+  .hero-visual{position:relative}
+  .report-card{position:relative;border:1px solid var(--line-strong);border-radius:var(--radius);
+    background:linear-gradient(180deg,rgba(16,26,42,.92),rgba(10,16,27,.94));
+    box-shadow:0 30px 80px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.04);
+    padding:18px 18px 14px;overflow:hidden}
+  .report-card::before{content:"";position:absolute;inset:0;pointer-events:none;
+    background:radial-gradient(420px 180px at 85% -10%,rgba(46,230,168,.1),transparent 70%)}
+  .report-head{display:flex;align-items:center;justify-content:space-between;font-size:13px;
+    font-weight:600;padding-bottom:14px;border-bottom:1px solid var(--line);color:#cdd9ec}
+  .tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-family:var(--mono);margin-right:8px}
+  .tag.green{background:var(--green-soft);color:var(--green);border:1px solid rgba(46,230,168,.24)}
+  .muted{color:var(--muted-2);font-weight:400;font-size:11.5px}
+  .report-row{display:grid;grid-template-columns:1.5fr .7fr .8fr .7fr;gap:8px;align-items:center;
+    padding:12px 6px;border-bottom:1px solid rgba(126,166,220,.08);font-size:12.5px;font-family:var(--mono)}
+  .report-row.head{color:var(--muted-2);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;padding-top:14px}
+  .report-row:last-of-type{border-bottom:none}
+  .score{color:var(--green);font-weight:700}
+  .good{color:var(--green)}
+  .bad{color:var(--red)}
+  .report-foot{display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:12px 6px 2px;
+    border-top:1px solid var(--line);font-size:12px;color:var(--muted)}
+  .pill{padding:3px 9px;border-radius:999px;background:rgba(255,200,87,.1);color:var(--amber);
+    border:1px solid rgba(255,200,87,.24);font-size:11px}
+  .float-chip{position:absolute;padding:9px 14px;border-radius:11px;font-size:11.5px;font-weight:600;
+    border:1px solid var(--line-strong);background:rgba(12,20,33,.92);backdrop-filter:blur(10px);
+    box-shadow:0 14px 34px rgba(0,0,0,.35);color:#bcd0ea}
+  .float-chip.c1{right:-18px;top:-22px;animation:float 5.5s ease-in-out infinite}
+  .float-chip.c2{left:-22px;bottom:-18px;animation:float 6.5s ease-in-out infinite reverse}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+
+  /* ── 数据条 ── */
+  .stats{border-top:1px solid var(--line);border-bottom:1px solid var(--line);
+    background:rgba(9,15,26,.5);margin-top:20px}
+  .stats-grid{display:grid;grid-template-columns:repeat(4,1fr)}
+  .stat{padding:26px 20px;text-align:center;border-right:1px solid var(--line)}
+  .stat:last-child{border-right:none}
+  .stat b{display:block;font-size:28px;font-weight:800;letter-spacing:-.02em;
+    background:linear-gradient(120deg,#fff,#9fdcff);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .stat span{font-size:12px;color:var(--muted-2);letter-spacing:.06em}
+
+  /* ── 通用区块 ── */
+  section{padding:92px 0;position:relative}
+  .sec-head{max-width:720px;margin-bottom:48px}
+  .kicker{font-family:var(--mono);font-size:11px;letter-spacing:.22em;color:var(--green);margin-bottom:14px}
+  h2{font-size:clamp(28px,3.4vw,42px);line-height:1.2;letter-spacing:-.015em;font-weight:800}
+  .sec-head p{margin-top:14px;color:var(--muted);font-size:15.5px}
+  .reveal{opacity:0;transform:translateY(18px);transition:opacity .7s ease,transform .7s ease}
+  .reveal.in{opacity:1;transform:none}
+
+  /* ── 流程 ── */
+  .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;position:relative}
+  .flow::before{content:"";position:absolute;top:46px;left:8%;right:8%;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(46,230,168,.45),rgba(98,168,255,.45),transparent)}
+  .step{position:relative;border:1px solid var(--line);border-radius:var(--radius);padding:26px 24px;
+    background:linear-gradient(180deg,rgba(15,24,39,.8),rgba(10,16,27,.65));
+    transition:border-color .3s,transform .3s}
+  .step:hover{border-color:rgba(46,230,168,.34);transform:translateY(-3px)}
+  .step-time{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;
+    color:#9ff3d6;background:rgba(46,230,168,.08);border:1px solid rgba(46,230,168,.2);
+    padding:5px 10px;border-radius:8px;margin-bottom:18px}
+  .step h3{font-size:18px;margin-bottom:10px}
+  .step p{font-size:13.5px;color:var(--muted)}
+  .step ul{list-style:none;margin-top:14px;font-size:12.5px;color:var(--muted-2)}
+  .step li{padding-left:16px;position:relative;margin-top:6px}
+  .step li::before{content:"";position:absolute;left:0;top:9px;width:5px;height:5px;border-radius:50%;
+    background:var(--green);opacity:.65}
+
+  /* ── 特性 ── */
+  .features{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .feature{border:1px solid var(--line);border-radius:16px;padding:24px;
+    background:rgba(11,18,30,.55);transition:border-color .3s,background .3s,transform .3s}
+  .feature:hover{border-color:var(--line-strong);background:rgba(15,24,39,.75);transform:translateY(-2px)}
+  .icon{width:40px;height:40px;border-radius:11px;display:grid;place-items:center;margin-bottom:16px;
+    background:linear-gradient(140deg,rgba(46,230,168,.16),rgba(98,168,255,.1));
+    border:1px solid rgba(46,230,168,.22);color:var(--green)}
+  .feature h3{font-size:15.5px;margin-bottom:7px}
+  .feature p{font-size:13px;color:var(--muted)}
+
+  /* ── 架构 ── */
+  .arch{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;align-items:stretch}
+  .arch-col{border:1px solid var(--line);border-radius:16px;padding:22px;background:rgba(11,18,30,.55);position:relative}
+  .arch-col h4{font-size:12px;letter-spacing:.14em;color:var(--muted-2);text-transform:uppercase;margin-bottom:16px}
+  .node{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:10px;
+    font-size:13px;background:rgba(18,29,47,.6)}
+  .node b{display:block;font-size:13px;color:var(--text);margin-bottom:2px}
+  .node span{font-size:11.5px;color:var(--muted-2);font-family:var(--mono)}
+  .arch-col.mid{border-color:rgba(46,230,168,.3);background:linear-gradient(180deg,rgba(46,230,168,.07),rgba(11,18,30,.6))}
+  .arch-col.mid::after{content:"";position:absolute;top:50%;right:-18px;width:20px;height:1px;background:rgba(46,230,168,.5)}
+  .arch-col.mid::before{content:"";position:absolute;top:50%;left:-18px;width:20px;height:1px;background:rgba(98,168,255,.5)}
+  .arch-col:last-child::after{display:none}
+
+  /* ── 快速开始 ── */
+  .start-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;align-items:start}
+  .terminal{border:1px solid var(--line-strong);border-radius:16px;overflow:hidden;
+    background:#080d17;box-shadow:0 24px 60px rgba(0,0,0,.35)}
+  .term-head{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;
+    background:rgba(255,255,255,.025);border-bottom:1px solid var(--line)}
+  .dots{display:flex;gap:6px}
+  .dots i{width:10px;height:10px;border-radius:50%;display:block}
+  .dots i:nth-child(1){background:#ff5f57}.dots i:nth-child(2){background:#febc2e}.dots i:nth-child(3){background:#28c840}
+  .term-head span{font-family:var(--mono);font-size:11px;color:var(--muted-2)}
+  .term-body{padding:20px 18px;font-family:var(--mono);font-size:12.5px;line-height:2.05;overflow-x:auto}
+  .term-body .cmt{color:#5f718c}
+  .term-body .cmd{color:#cfe3ff}
+  .term-body .cmd::before{content:"$ ";color:var(--green)}
+  .term-body .out{color:#7ee7c3}
+  .copy-btn{background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--muted);
+    font-size:11px;padding:5px 10px;border-radius:7px;cursor:pointer;transition:.2s}
+  .copy-btn:hover{color:var(--text);border-color:var(--line-strong)}
+  .start-notes{display:flex;flex-direction:column;gap:14px}
+  .note{border:1px solid var(--line);border-radius:12px;padding:16px 18px;background:rgba(11,18,30,.55)}
+  .note b{display:block;font-size:13.5px;margin-bottom:5px}
+  .note p{font-size:12.5px;color:var(--muted)}
+  .note.warn{border-color:rgba(255,200,87,.26);background:rgba(255,200,87,.05)}
+  .note.warn b{color:var(--amber)}
+
+  /* ── 文档 ── */
+  .docs-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+  .doc-card{border:1px solid var(--line);border-radius:16px;padding:24px;background:rgba(11,18,30,.55);
+    transition:border-color .3s,transform .3s}
+  .doc-card:hover{border-color:rgba(46,230,168,.3);transform:translateY(-2px)}
+  .doc-card .kicker{margin-bottom:10px}
+  .doc-card h3{font-size:17px;margin-bottom:8px}
+  .doc-card p{font-size:13px;color:var(--muted);margin-bottom:18px}
+  .doc-link{font-size:13px;color:var(--green);font-weight:600}
+  .doc-link::after{content:" →";display:inline-block;transition:transform .2s}
+  .doc-card:hover .doc-link::after{transform:translateX(3px)}
+
+  /* ── 免责声明 ── */
+  .disclaimer{border:1px solid rgba(255,92,114,.24);border-radius:16px;padding:26px 28px;
+    background:linear-gradient(120deg,rgba(255,92,114,.07),rgba(11,18,30,.4))}
+  .disclaimer h3{display:flex;align-items:center;gap:10px;font-size:16px;color:#ffb3be;margin-bottom:10px}
+  .disclaimer p{font-size:13.5px;color:var(--muted)}
+  .disclaimer p + p{margin-top:8px}
+
+  /* ── 页脚 ── */
+  footer{border-top:1px solid var(--line);padding:34px 0;margin-top:40px}
+  .foot{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;
+    font-size:12.5px;color:var(--muted-2)}
+  .foot-links{display:flex;gap:20px}
+  .foot-links a:hover{color:var(--text)}
+
+  /* ── 响应式 ── */
+  @media (max-width:980px){
+    .hero-grid{grid-template-columns:1fr;gap:50px}
+    .hero{padding-top:130px}
+    .flow,.features,.arch,.docs-grid{grid-template-columns:1fr}
+    .flow::before{display:none}
+    .arch-col.mid::before,.arch-col.mid::after{display:none}
+    .start-grid{grid-template-columns:1fr}
+    .stats-grid{grid-template-columns:repeat(2,1fr)}
+    .stat:nth-child(2){border-right:none}
+    .stat:nth-child(3),.stat:nth-child(4){border-top:1px solid var(--line)}
+    .float-chip.c1{right:0}
+    .float-chip.c2{left:0}
+  }
+  @media (max-width:720px){
+    .wrap{width:calc(100% - 32px)}
+    .nav-links{display:none}
+    .nav-links.open{display:flex;position:absolute;top:70px;left:0;right:0;flex-direction:column;
+      gap:0;padding:12px 20px 18px;background:rgba(6,10,18,.98);border-bottom:1px solid var(--line)}
+    .nav-links.open a{padding:11px 0;border-bottom:1px solid rgba(126,166,220,.08)}
+    .menu-btn{display:block}
+    .nav-cta .btn.ghost{display:none}
+    section{padding:70px 0}
+    .hero-actions .btn{flex:1}
+    .report-row{font-size:11.5px}
+  }
+</style>
+</head>
+<body>
+<div class="page-bg"></div>
+<div class="page-grid"></div>
+
+<header id="site-header">
+  <div class="wrap nav">
+    <a class="brand" href="#top" aria-label="返回顶部">
+      <span class="brand-mark">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2ee6a8" stroke-width="2" stroke-linecap="round">
+          <path d="M4 19V9M9 19V5M14 19v-7M19 19V8"/>
+        </svg>
+      </span>
+      <span>尾盘引擎<small>TAIL MOMENTUM</small></span>
+    </a>
+    <nav class="nav-links" id="nav-links">
+      <a href="#flow">策略流程</a>
+      <a href="#features">核心能力</a>
+      <a href="#arch">系统架构</a>
+      <a href="#start">快速开始</a>
+      <a href="#docs">文档</a>
+    </nav>
+    <div class="nav-cta">
+      <a class="btn ghost" href="https://github.com/kangkangxi/stock-strategy" target="_blank" rel="noreferrer">GitHub ↗</a>
+      <button class="menu-btn" id="menu-btn" aria-label="打开菜单">☰</button>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- Hero -->
+  <section class="hero" id="top">
+    <div class="wrap hero-grid">
+      <div class="hero-copy">
+        <div class="eyebrow"><span class="dot"></span> OPEN SOURCE · PYTHON · ZERO DEPENDENCY</div>
+        <h1>尾盘选股<br><span class="grad">次日冲高兑现</span></h1>
+        <p class="lead">围绕「14:30 强势股筛选 → 14:51 尾盘确认买入 → 次日冲高卖出」构建的 A 股短线策略引擎。纯标准库、无未来函数、报告全流程可复盘。</p>
+        <div class="hero-actions">
+          <a class="btn primary" href="#start">快速开始</a>
+          <a class="btn ghost" href="https://github.com/kangkangxi/stock-strategy" target="_blank" rel="noreferrer">查看源码 ↗</a>
+        </div>
+        <div class="hero-meta">
+          <span>Python 3.8+</span>
+          <span>0 第三方依赖</span>
+          <span>MIT License</span>
+        </div>
+      </div>
+
+      <div class="hero-visual">
+        <div class="report-card">
+          <div class="report-head">
+            <div><span class="tag green">14:51</span>尾盘确认 · 买入清单</div>
+            <span class="muted">示例数据</span>
+          </div>
+          <div class="report-row head"><span>标的</span><span>评分</span><span>止损</span><span>盈亏比</span></div>
+          <div class="report-row"><span>示例 600XXX</span><span class="score">86</span><span class="bad">-2.1%</span><span class="good">2.4</span></div>
+          <div class="report-row"><span>示例 000XXX</span><span class="score">81</span><span class="bad">-2.6%</span><span class="good">2.2</span></div>
+          <div class="report-row"><span>示例 002XXX</span><span class="score">77</span><span class="bad">-3.0%</span><span class="good">2.1</span></div>
+          <div class="report-row"><span>示例 300XXX</span><span class="score">74</span><span class="bad">-2.8%</span><span class="good">2.0</span></div>
+          <div class="report-foot">
+            <span>市场环境 · 板块强度</span>
+            <span class="pill">偏强</span>
+          </div>
+        </div>
+        <div class="float-chip c1">三层数据校验 ✓</div>
+        <div class="float-chip c2">无未来函数</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="wrap stats-grid">
+      <div class="stat"><b>0</b><span>第三方依赖</span></div>
+      <div class="stat"><b>6+</b><span>运行模式</span></div>
+      <div class="stat"><b>3</b><span>行情源交叉校验</span></div>
+      <div class="stat"><b>100%</b><span>标准库实现</span></div>
+    </div>
+  </div>
+
+  <!-- Flow -->
+  <section id="flow">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">WORKFLOW</div>
+        <h2>一条完整的尾盘交易链路</h2>
+        <p>从全市场初筛到次日退出，每个环节都有明确的输入、硬性条件与可审计输出。</p>
+      </div>
+      <div class="flow">
+        <div class="step reveal">
+          <div class="step-time">14:31 · 初筛</div>
+          <h3>全市场强势股筛选</h3>
+          <p>按涨幅区间、成交额、换手率、量比过滤，再叠加日 K 位置与 10 分钟均线结构。</p>
+          <ul>
+            <li>涨幅 3% ~ 8% 初筛池</li>
+            <li>日 K 启动形态 A / B 分类</li>
+            <li>尾盘强度与量能配合评分</li>
+          </ul>
+        </div>
+        <div class="step reveal">
+          <div class="step-time">14:51 · 确认</div>
+          <h3>二次校验与买入清单</h3>
+          <p>按最新行情复核候选，硬性条件失败即淘汰，最多生成 5 只买入标的。</p>
+          <ul>
+            <li>止损价与盈亏比测算</li>
+            <li>持仓退出优先处理</li>
+            <li>Markdown + JSON 双输出</li>
+          </ul>
+        </div>
+        <div class="step reveal">
+          <div class="step-time">次日 · 退出</div>
+          <h3>开盘决断与盘中巡检</h3>
+          <p>9:35 按开盘情景 A–E 判定，冲高卖出或继续观察，14:51 最迟退出。</p>
+          <ul>
+            <li>每半小时持仓状态巡检</li>
+            <li>次日冲高与回落监控</li>
+            <li>周 / 月复盘沉淀参数</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Features -->
+  <section id="features">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">CAPABILITIES</div>
+        <h2>为「可验证」而设计</h2>
+        <p>不追求复杂框架，把数据校验、时点一致性和复盘闭环做扎实。</p>
+      </div>
+      <div class="features">
+        <div class="feature reveal">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5"/></svg></div>
+          <h3>零依赖单文件引擎</h3>
+          <p>只用 Python 标准库，复制即可运行，部署成本极低，便于审计与二次开发。</p>
+        </div>
+        <div class="feature reveal">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 18V9M9 18V5M14 18v-6M19 18V7"/><path d="M3 21h18"/></svg></div>
+          <h3>无未来函数</h3>
+          <p>10 分钟 K 线只使用已收盘 bar，日 K 当日 bar 明确标记「进行中」，复算也不会读取未来数据。</p>
+        </div>
+        <div class="feature reveal">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z"/><path d="M9 12l2 2 4-4"/></svg></div>
+          <h3>三层数据校验</h3>
+          <p>行情自洽 → 东财与腾讯双源交叉 → K 线历史合法性检查，关键失败不出交易名单。</p>
+        </div>
+        <div class="feature reveal">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg></div>
+          <h3>结构化报告</h3>
+          <p>候选、买入清单、持仓监控、周月总结均为 Markdown + JSON，人读与机器复盘两不误。</p>
+        </div>
+        <div class="feature reveal">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8"/><path d="M12 7v5l3 2"/></svg></div>
+          <h3>影子跟踪</h3>
+          <p>对初筛池做「假设买入」前向跟踪，扩大样本，检验每个筛选关卡是否在漏掉好票。</p>
+        </div>
+        <div class="feature reveal">
+          <div class="icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 17l5-5 4 3 6-8 3 4"/><path d="M3 21h18"/></svg></div>
+          <h3>复盘与参数迭代</h3>
+          <p>胜率、盈亏比、最大回撤、选股漏斗与分档统计，用数据决定参数是否值得调整。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Architecture -->
+  <section id="arch">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">ARCHITECTURE</div>
+        <h2>数据 → 引擎 → 可审计输出</h2>
+        <p>单进程、无外部服务依赖；所有中间结果落盘，失败可追溯。</p>
+      </div>
+      <div class="arch">
+        <div class="arch-col reveal">
+          <h4>Data Sources</h4>
+          <div class="node"><b>东方财富</b><span>涨幅榜 · 日K · 5分钟K</span></div>
+          <div class="node"><b>腾讯行情</b><span>实时价格 · 涨跌停价</span></div>
+          <div class="node"><b>新浪财经</b><span>备用 K 线 · 交叉校验</span></div>
+        </div>
+        <div class="arch-col mid reveal">
+          <h4>Strategy Engine</h4>
+          <div class="node"><b>初筛与评分</b><span>filters → score → rank</span></div>
+          <div class="node"><b>时点控制</b><span>clock guard · no future data</span></div>
+          <div class="node"><b>持仓与退出</b><span>scenario A–E · stop loss</span></div>
+          <div class="node"><b>复盘统计</b><span>funnel · shadow · snapshot</span></div>
+        </div>
+        <div class="arch-col reveal">
+          <h4>Outputs</h4>
+          <div class="node"><b>Markdown 报告</b><span>候选 / 买入 / 监控 / 总结</span></div>
+          <div class="node"><b>JSON 数据</b><span>结构化候选与成交记录</span></div>
+          <div class="node"><b>可选推送</b><span>webhook · 只通知不下单</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Quick start -->
+  <section id="start">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">QUICK START</div>
+        <h2>三分钟跑起来</h2>
+        <p>只需要 Python 3.8+ 和可访问行情接口的网络环境。</p>
+      </div>
+      <div class="start-grid">
+        <div class="terminal reveal">
+          <div class="term-head">
+            <div class="dots"><i></i><i></i><i></i></div>
+            <span>bash · stock-strategy</span>
+            <button class="copy-btn" id="copy-btn" type="button">复制</button>
+          </div>
+          <div class="term-body" id="code-block"><span class="cmt"># 1. 克隆仓库</span>
+<span class="cmd">git clone git@github.com:kangkangxi/stock-strategy.git</span>
+<span class="cmd">cd stock-strategy</span>
+
+<span class="cmt"># 2. 生成本地配置（不会提交）</span>
+<span class="cmd">cp config.example.json config.json</span>
+
+<span class="cmt"># 3. 查看持仓与统计</span>
+<span class="cmd">python3 scripts/tail_momentum.py --mode status</span>
+
+<span class="cmt"># 4. 试跑尾盘初筛：只出报告，不推送</span>
+<span class="cmd">python3 scripts/tail_momentum.py --mode scan --dry-run</span>
+<span class="out">→ 报告/尾盘选股_YYYY-MM-DD.md</span></div>
+        </div>
+        <div class="start-notes reveal">
+          <div class="note">
+            <b>运行时目录</b>
+            <p>首次运行会自动创建 <code>报告/</code>、<code>日志/</code> 与 <code>positions.json</code>，这些均被 <code>.gitignore</code> 排除。</p>
+          </div>
+          <div class="note">
+            <b>推送默认关闭</b>
+            <p>需要通知时，把 <code>config.json</code> 的 <code>push</code> 设为 <code>true</code>，并提供自己的 <code>wecom_push.py</code>。</p>
+          </div>
+          <div class="note warn">
+            <b>隐私提醒</b>
+            <p><code>positions.json</code>、<code>报告/</code>、<code>日志/</code> 含真实交易数据，请勿提交到公开仓库。</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Docs -->
+  <section id="docs">
+    <div class="wrap">
+      <div class="sec-head reveal">
+        <div class="kicker">DOCUMENTATION</div>
+        <h2>从使用到实现</h2>
+        <p>三份文档覆盖快速上手、运维细节与策略规则。</p>
+      </div>
+      <div class="docs-grid">
+        <a class="doc-card reveal" href="https://github.com/kangkangxi/stock-strategy#readme" target="_blank" rel="noreferrer">
+          <div class="kicker">README</div>
+          <h3>快速开始</h3>
+          <p>项目概览、核心特性、常用命令、配置说明与目录结构。</p>
+          <span class="doc-link">阅读 README</span>
+        </a>
+        <a class="doc-card reveal" href="https://github.com/kangkangxi/stock-strategy/blob/main/docs/OPERATIONS.md" target="_blank" rel="noreferrer">
+          <div class="kicker">OPERATIONS</div>
+          <h3>运维手册</h3>
+          <p>运行模式、报告口径、影子跟踪、K 线快照与复盘统计细节。</p>
+          <span class="doc-link">阅读运维手册</span>
+        </a>
+        <a class="doc-card reveal" href="https://github.com/kangkangxi/stock-strategy/blob/main/%E7%AD%96%E7%95%A5%E6%96%87%E6%A1%A3.md" target="_blank" rel="noreferrer">
+          <div class="kicker">STRATEGY</div>
+          <h3>策略文档</h3>
+          <p>尾盘强势股筛选与次日冲高卖出的完整规则与参数定义。</p>
+          <span class="doc-link">阅读策略文档</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Disclaimer -->
+  <section style="padding-top:0">
+    <div class="wrap">
+      <div class="disclaimer reveal">
+        <h3><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>风险与免责声明</h3>
+        <p>本项目仅用于量化策略研究与工程实践，<b>不构成任何投资建议</b>。策略参数是待验证的初始假设，尚未完成严格的历史回测与实盘验证。</p>
+        <p>行情数据来自第三方公开接口，可能存在延迟、缺失或错误；引擎不自动下单，任何交易决策与后果均由使用者自行承担。</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap foot">
+    <div>© <span id="year">2026</span> kangkangxi · 以 MIT License 开源</div>
+    <div class="foot-links">
+      <a href="https://github.com/kangkangxi/stock-strategy" target="_blank" rel="noreferrer">GitHub</a>
+      <a href="https://github.com/kangkangxi/stock-strategy/issues" target="_blank" rel="noreferrer">Issues</a>
+      <a href="#top">回到顶部 ↑</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // 顶栏滚动状态
+  const header = document.getElementById('site-header');
+  const onScroll = () => header.classList.toggle('scrolled', window.scrollY > 12);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+
+  // 移动端菜单
+  const menuBtn = document.getElementById('menu-btn');
+  const navLinks = document.getElementById('nav-links');
+  menuBtn.addEventListener('click', () => navLinks.classList.toggle('open'));
+  navLinks.querySelectorAll('a').forEach(a => a.addEventListener('click', () => navLinks.classList.remove('open')));
+
+  // 复制命令
+  const copyBtn = document.getElementById('copy-btn');
+  copyBtn.addEventListener('click', async () => {
+    const text = document.getElementById('code-block').innerText;
+    try {
+      await navigator.clipboard.writeText(text);
+      copyBtn.textContent = '已复制';
+    } catch (e) {
+      copyBtn.textContent = '复制失败';
+    }
+    setTimeout(() => copyBtn.textContent = '复制', 1600);
+  });
+
+  // 滚动入场
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('in');
+        io.unobserve(entry.target);
+      }
+    });
+  }, { threshold: 0.12 });
+  document.querySelectorAll('.reveal').forEach(el => io.observe(el));
+
+  document.getElementById('year').textContent = new Date().getFullYear();
+</script>
+</body>
+</html>
