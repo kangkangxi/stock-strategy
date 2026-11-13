@@ -146,6 +146,16 @@ stock-strategy/
 └── 日志/                        运行时生成，已忽略
 ```
 
+## 项目介绍页
+
+`docs/index.html` 是一个零依赖的静态介绍页（响应式，支持移动端）。推送到 GitHub 后：
+
+1. 打开仓库 **Settings → Pages**；
+2. Source 选择 **Deploy from a branch**；
+3. 分支选择 `main`，目录选择 `/docs`，保存。
+
+稍等片刻即可通过 `https://kangkangxi.github.io/stock-strategy/` 访问。
+
 ## 定时任务（可选）
 
 以下为 Linux cron 示例，按需调整时间与路径：
