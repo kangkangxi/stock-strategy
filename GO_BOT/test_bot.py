@@ -155,10 +155,10 @@ class BotTests(unittest.TestCase):
                 version = store.version(self.now)
             self.state["jobs"]["2026-11-16/scan"] = {"status": "done", "research_version": version}
             path = self.bot.runtime / SHORT / "报告" / "候选_2026-11-16.json"
-            dump(path, {"date": "2026-11-16", "validations": ["\u274c critical"]})
+            dump(path, {"date": "2026-11-16", "validations": ["\u2705 日K历史：\u274c3", "\u274c 日K全源缺失"]})
             with self.assertRaisesRegex(RuntimeError, "校验异常"):
                 self.bot.guard(pm, self.now, self.state)
-            dump(path, {"date": "2026-11-16", "validations": ["passed"]})
+            dump(path, {"date": "2026-11-16", "validations": ["\u2705 行情自洽性：\u270553 \u26a0\ufe0f0 \u274c0"]})
             self.bot.guard(pm, self.now, self.state)
 
     def test_nonempty_runtime_holdings_are_blocked(self):

@@ -78,6 +78,11 @@ def due(now, completed):
     return result
 
 
+# The engine marks each item's status with its leading symbol; "❌0" inside a summary is only a count.
+def failed(validations):
+    return any(not isinstance(item, str) or item.lstrip().startswith("\u274c") for item in validations)
+
+
 def fresh(env, now, max_age=300):
     ts = env.get("ts")
     sh = next((item for item in env.get("indices", []) if item.get("code") == "000001"), {})
@@ -232,7 +237,7 @@ class Bot:
             candidates = read(self.runtime / SHORT / "报告" / f"候选_{now:%Y-%m-%d}.json", {})
             if candidates.get("date") != now.strftime("%Y-%m-%d") or not candidates.get("validations"):
                 raise RuntimeError("缺少当日候选或校验结果。")
-            if any("\u274c" in item for item in candidates["validations"]):
+            if failed(candidates["validations"]):
                 raise RuntimeError("候选包含校验异常，禁止尾盘确认。")
 
     def report_path(self, job, now):
@@ -330,7 +335,7 @@ class Bot:
                 data = read(path, {})
                 if (not data.get("validations") or data.get("date") != now.date().isoformat()
                         or path.stat().st_mtime_ns < started_ns
-                        or any("\u274c" in item for item in data["validations"])):
+                        or failed(data["validations"])):
                     raise RuntimeError("初筛校验异常、文件过期或无结果，禁止后续确认。")
             if job.mode == "pm":
                 settlement = state["jobs"].get(f"{now:%Y-%m-%d}/paper_settle", {})
