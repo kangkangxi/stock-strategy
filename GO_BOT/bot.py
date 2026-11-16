@@ -123,18 +123,11 @@ class Bot:
     def initialize(self):
         if self.runtime.exists():
             raise RuntimeError("隔离目录已存在，不覆盖已有运行数据。")
-        engine = self.source / "scripts" / "tail_momentum.py"
-        config = next((path for path in (self.source / "config.json", self.source / "config.example.json")
-                       if path.is_file()), None)
-        if not engine.is_file() or config is None:
-            raise RuntimeError(f"缺少策略脚本或配置：{self.source}")
+        config = self.strategy_config()
         self.runtime.mkdir(parents=True)
         shutil.copytree(self.source, self.runtime / SHORT,
                         ignore=shutil.ignore_patterns(self.home.name, ".git", "__pycache__", "*.bak", "*.bak-*"))
-        cfg = read(config, {})
-        cfg["push"] = False
-        cfg["paper_track"] = False
-        dump(self.runtime / SHORT / "config.json", cfg)
+        self.write_runtime_config(config)
         positions_file = self.runtime / SHORT / "positions.json"
         if positions_file.is_file():
             positions = read(positions_file, {})
@@ -145,6 +138,36 @@ class Bot:
             store.bootstrap(self.source, datetime.now(CST))
         dump(self.state_file, {"jobs": {}})
         print(f"隔离副本已建立：{self.runtime}；独立研究账本，不登记原引擎持仓，不下单。")
+
+    def strategy_config(self):
+        config = next((path for path in (self.source / "config.json", self.source / "config.example.json")
+                       if path.is_file()), None)
+        if not (self.source / "scripts" / "tail_momentum.py").is_file() or config is None:
+            raise RuntimeError(f"缺少策略脚本或配置：{self.source}")
+        return config
+
+    def write_runtime_config(self, config):
+        cfg = read(config, {})
+        cfg["push"] = False
+        cfg["paper_track"] = False
+        dump(self.runtime / SHORT / "config.json", cfg)
+
+    def update(self, now):
+        if not self.runtime.is_dir() or not self.state_file.is_file():
+            raise RuntimeError("尚未完成初始化；先运行 --init。")
+        jobs = read(self.state_file, {"jobs": {}})["jobs"]
+        if jobs.get(f"{now:%Y-%m-%d}/scan", {}).get("status") == "done" and f"{now:%Y-%m-%d}/pm" not in jobs:
+            raise RuntimeError("今日初筛已完成、尾盘确认尚未执行；确认后再更新，避免混用策略版本。")
+        config = self.strategy_config()
+        with self.research() as store:
+            before = store.version(now)
+            store.archive("runtime/" + SHORT, self.runtime / SHORT, now)
+            shutil.copytree(self.source, self.runtime / SHORT, dirs_exist_ok=True, ignore=shutil.ignore_patterns(
+                self.home.name, ".git", "__pycache__", "*.bak", "*.bak-*",
+                "positions.json*", "报告", "日志", "config.json", "最新推送.md", "*.log"))
+            self.write_runtime_config(config)
+            store.archive("runtime/" + SHORT, self.runtime / SHORT, now)
+            return {"previous_version": before, "version": store.version(now)}
 
     @contextlib.contextmanager
     def research(self):
@@ -365,6 +388,7 @@ def main():
     action.add_argument("--tick", action="store_true")
     action.add_argument("--research-init", action="store_true", help="只读归档原资料并初始化独立研究，不联网、不推送")
     action.add_argument("--research-report", choices=["all", "week", "month"], help="本地生成版本对比报告，不联网、不推送")
+    action.add_argument("--update", action="store_true", help="把仓库中的策略代码与参数同步到运行副本，保留累计数据")
     action.add_argument("--run", choices=[j.name for j in JOBS] + ["status"])
     parser.add_argument("--date", help="仅 --plan 可用，YYYY-MM-DD")
     args = parser.parse_args()
@@ -374,6 +398,11 @@ def main():
     now = datetime.now(CST)
     if args.init:
         bot.initialize()
+    elif args.update:
+        with lock(bot.home / "bot.lock") as acquired:
+            if not acquired:
+                raise RuntimeError("机器人正在执行，稍后再更新。")
+            print(json.dumps(bot.update(now), ensure_ascii=False, indent=2))
     elif args.research_init or args.research_report:
         if not bot.runtime.is_dir() or not bot.state_file.is_file():
             raise RuntimeError("先完成机器人隔离初始化。")

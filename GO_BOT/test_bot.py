@@ -286,6 +286,37 @@ class BotTests(unittest.TestCase):
         with patch.object(self.bot, "guard"), patch.object(self.bot, "notify", side_effect=notify):
             self.assertEqual(self.bot.run(self.now, job), 0)
 
+    def test_update_syncs_strategy_and_keeps_accumulated_data(self):
+        copied = self.bot.runtime / SHORT
+        dump(copied / "positions.json", {"positions": [], "paper": {"trades": [{"code": "600001"}]}})
+        dump(copied / "报告" / "候选_2026-11-16.json", {"date": "2026-11-16"})
+        with self.bot.research() as store:
+            old = store.version(self.now)
+        (self.source / "scripts" / "tail_momentum.py").write_text("print('optimized')\n", encoding="utf-8")
+        dump(self.source / "config.json", {"push": True, "paper_track": True, "pct_low": 4})
+        dump(self.source / "报告" / "候选_2026-11-16.json", {"date": "source must not overwrite"})
+        result = self.bot.update(self.now)
+        self.assertEqual(result["previous_version"], old)
+        self.assertNotEqual(result["version"], old)
+        self.assertEqual((copied / "scripts" / "tail_momentum.py").read_text(encoding="utf-8"), "print('optimized')\n")
+        self.assertEqual(read(copied / "config.json", {}), {"push": False, "paper_track": False, "pct_low": 4})
+        self.assertEqual(read(copied / "positions.json", {})["paper"]["trades"], [{"code": "600001"}])
+        self.assertEqual(read(copied / "报告" / "候选_2026-11-16.json", {}), {"date": "2026-11-16"})
+        with self.bot.research() as store:
+            self.assertEqual(store.version(self.now), result["version"])
+
+    def test_update_refused_between_scan_and_confirmation(self):
+        dump(self.bot.state_file, {"jobs": {"2026-11-16/scan": {"status": "done"}}})
+        engine = self.bot.runtime / SHORT / "scripts" / "tail_momentum.py"
+        before = engine.read_bytes()
+        (self.source / "scripts" / "tail_momentum.py").write_text("print('new')\n", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "尾盘确认尚未执行"):
+            self.bot.update(self.now)
+        self.assertEqual(engine.read_bytes(), before)
+        dump(self.bot.state_file, {"jobs": {"2026-11-16/scan": {"status": "done"}, "2026-11-16/pm": {"status": "done"}}})
+        self.bot.update(self.now)
+        self.assertEqual(engine.read_text(encoding="utf-8"), "print('new')\n")
+
     def test_paper_settlement_precedes_confirmation(self):
         at = self.now.replace(minute=51)
         self.assertEqual([j.name for j in due(at, {})], ["paper_settle", "pm"])

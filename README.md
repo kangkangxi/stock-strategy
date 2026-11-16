@@ -218,11 +218,21 @@ powershell -ExecutionPolicy RemoteSigned -File .\install-task.ps1 -Python (Get-C
 | `python -X utf8 bot.py --plan [--date YYYY-MM-DD]` | 列出当天会执行的任务，不运行 |
 | `python -X utf8 bot.py --run status` | 手动跑一次持仓状态检查 |
 | `python -X utf8 bot.py --research-report all` | 离线生成全部版本的模拟统计报告 |
+| `python -X utf8 bot.py --update` | 把仓库里的策略代码与参数同步到运行副本，保留累计数据 |
+
+### 根据累计数据优化策略并发布
+
+1. **看数据**：`python -X utf8 bot.py --research-report all`，报告写入 `GO_BOT\research\reports\`（`.txt` 供阅读，`.json` 供分析）；每周五、每月首个工作日也会自动生成。各策略版本分别统计，比较时注意样本量。
+2. **改策略**：修改 `scripts\tail_momentum.py` 或 `config.example.json`（仓库中的标准参数文件；本机若有 `config.json` 会优先使用，但它不提交）。
+3. **自检**：`python -B -X utf8 -m unittest discover -s . -p "test_*.py"`（在 `GO_BOT\` 下运行）。
+4. **同步到本机运行副本**：`python -X utf8 bot.py --update`。它先归档旧版本，再覆盖策略代码与参数，持仓、报告、日志、研究账本都保留；新代码与参数自动成为新的研究版本。当天已完成初筛、尚未尾盘确认时会拒绝更新，避免同一天混用两个版本。
+5. **发布**：`git add`、`git commit`、`git push`。提交前用 `git status` 确认没有运行数据或 `push_config.json`。
+6. **其他设备**：`git pull` 后同样运行 `python -X utf8 bot.py --update`。
 
 说明：
 
 - 运行数据（`runtime/`、`research/`、`logs/`、`state.json`）和 `push_config.json` 都已被 `.gitignore` 排除，每台设备各自积累，不随代码同步。
-- 修改策略代码或参数后需要在新设备上重新 `--init`（或删除旧 `runtime/` 后再初始化）才会使用新版本；研究账本按代码与参数的哈希区分版本，不同版本分别统计。
+- 研究账本按代码与参数的哈希区分版本；`--update` 或任何代码改动都会开启新版本统计，旧版本数据保留、不混算。
 - 多台设备同时启用推送会向同一飞书群重复发送，建议只在一台设备上开启。
 - 模拟成交使用最新价加不利滑点，没有盘口保证；统计用于研究，不代表真实收益。
 
