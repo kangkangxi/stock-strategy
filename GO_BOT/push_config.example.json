@@ -1,0 +1,4 @@
+{
+  "enabled": false,
+  "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/00000000-0000-0000-0000-000000000000"
+}

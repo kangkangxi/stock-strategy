@@ -142,6 +142,12 @@ stock-strategy/
 ├── docs/
 │   ├── OPERATIONS.md            运维与实现细节
 │   └── index.html               项目介绍页（可发布到 GitHub Pages）
+├── GO_BOT/                      Windows 定时机器人与独立模拟账本（见下文）
+│   ├── bot.py                   调度、行情门禁、飞书推送
+│   ├── research.py              版本化存档、模拟账本、周/月报告
+│   ├── install-task.ps1         注册 Windows 计划任务
+│   ├── push_config.example.json 飞书推送配置模板
+│   └── test_*.py                离线测试
 ├── 报告/                        运行时生成，已忽略
 └── 日志/                        运行时生成，已忽略
 ```
@@ -180,6 +186,45 @@ stock-strategy/
 - 开启方式：`config.json → "push": true`。
 
 推送器不属于本仓库（避免误提交 webhook 密钥），请自行实现或使用现有通知服务。
+
+## Windows 定时机器人（GO_BOT）
+
+`GO_BOT/` 在 Windows 上每分钟检查一次，在交易日按时点隔离运行策略（初筛、尾盘确认、持仓监控、K 线快照），并把确认信号记入**独立模拟账本**，周五和每月首个工作日生成按策略版本分组的统计，可选推送到飞书。它不连接券商、不下单、不修改仓库里的 `positions.json`。
+
+要求：Windows、Python 3.10+（仅标准库）、系统时区 UTC+8；计划任务以当前用户身份运行，交易时段需要开机且已登录。
+
+```powershell
+git clone git@github.com:kangkangxi/stock-strategy.git
+cd stock-strategy\GO_BOT
+
+# 1. 离线自检
+python -B -X utf8 -m unittest discover -s . -p "test_*.py"
+
+# 2. 建立隔离运行副本与研究账本（复制策略到 GO_BOT\runtime；无 config.json 时使用 config.example.json）
+python -X utf8 bot.py --init
+
+# 3. 可选：启用飞书推送
+copy push_config.example.json push_config.json   # 填入真实 webhook，并把 enabled 改为 true
+
+# 4. 查看今天的计划，然后注册计划任务（已存在同名任务时不会覆盖）
+python -X utf8 bot.py --plan
+powershell -ExecutionPolicy RemoteSigned -File .\install-task.ps1 -Python (Get-Command python).Source
+```
+
+常用命令：
+
+| 命令 | 作用 |
+|---|---|
+| `python -X utf8 bot.py --plan [--date YYYY-MM-DD]` | 列出当天会执行的任务，不运行 |
+| `python -X utf8 bot.py --run status` | 手动跑一次持仓状态检查 |
+| `python -X utf8 bot.py --research-report all` | 离线生成全部版本的模拟统计报告 |
+
+说明：
+
+- 运行数据（`runtime/`、`research/`、`logs/`、`state.json`）和 `push_config.json` 都已被 `.gitignore` 排除，每台设备各自积累，不随代码同步。
+- 修改策略代码或参数后需要在新设备上重新 `--init`（或删除旧 `runtime/` 后再初始化）才会使用新版本；研究账本按代码与参数的哈希区分版本，不同版本分别统计。
+- 多台设备同时启用推送会向同一飞书群重复发送，建议只在一台设备上开启。
+- 模拟成交使用最新价加不利滑点，没有盘口保证；统计用于研究，不代表真实收益。
 
 ## 数据源与校验
 

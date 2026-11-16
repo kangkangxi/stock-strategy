@@ -7,6 +7,16 @@ config.json
 最新推送.md
 *.log
 
+# ── GO_BOT 本机运行数据与飞书 webhook，禁止提交 ──
+GO_BOT/runtime/
+GO_BOT/research/
+GO_BOT/logs/
+GO_BOT/state.json
+GO_BOT/*.tmp
+GO_BOT/bot.lock
+GO_BOT/push_config.json
+GO_BOT/research_config.json
+
 # ── 密钥与凭据 ──
 .env
 .env.*
