@@ -24,6 +24,9 @@ BACKTEST/reports/
 BACKTEST/notifications/
 BACKTEST/config.json
 
+# ── 前向验证冻结清单、原始输入与评估报告，禁止提交 ──
+GO_BOT/validation/
+
 # ── 密钥与凭据 ──
 .env
 .env.*

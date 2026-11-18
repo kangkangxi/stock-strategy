@@ -18,6 +18,9 @@ from datetime import datetime, timedelta, timezone
 
 from research import Research
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from VALIDATION.evidence import Recorder, selection_chain, start_campaign, verify_campaign
+
 HOME = Path(__file__).resolve().parent
 STRATEGY = HOME.parent
 CST = timezone(timedelta(hours=8))
@@ -123,6 +126,28 @@ class Bot:
         self.source = Path(source)
         self.runtime = self.home / "runtime"
         self.state_file = self.home / "state.json"
+        self.validation_root = self.home / "validation"
+        self._evidence = None
+
+    def record_evidence(self, kind, data):
+        if self._evidence is not None:
+            try:
+                self._evidence.event(kind, data)
+            except Exception as error:
+                name = type(error).__name__
+                if name not in self._evidence.errors:
+                    self._evidence.errors.append(name)
+
+    def validation_paths(self):
+        module = HOME.parent / "VALIDATION"
+        return {"engine": self.runtime / SHORT / "scripts" / "tail_momentum.py",
+                "bot": Path(__file__), "research": Path(__file__).with_name("research.py"),
+                **{name: module / (name + ".py") for name in ("evidence", "run", "assess")}}
+
+    def validation_start(self, now):
+        with self.research() as store:
+            version = store.version(now)
+            return start_campaign(self.validation_root, version, store.spec(version), now, self.validation_paths())
 
     def initialize(self):
         if self.runtime.exists():
@@ -130,7 +155,7 @@ class Bot:
         config = self.strategy_config()
         self.runtime.mkdir(parents=True)
         shutil.copytree(self.source, self.runtime / SHORT,
-                        ignore=shutil.ignore_patterns(self.home.name, ".git", "__pycache__", "*.bak", "*.bak-*"))
+                        ignore=shutil.ignore_patterns(self.home.name, "VALIDATION", ".git", "__pycache__", "*.bak", "*.bak-*"))
         self.write_runtime_config(config)
         positions_file = self.runtime / SHORT / "positions.json"
         if positions_file.is_file():
@@ -167,7 +192,7 @@ class Bot:
             before = store.version(now)
             store.archive("runtime/" + SHORT, self.runtime / SHORT, now)
             shutil.copytree(self.source, self.runtime / SHORT, dirs_exist_ok=True, ignore=shutil.ignore_patterns(
-                self.home.name, ".git", "__pycache__", "*.bak", "*.bak-*",
+                self.home.name, "VALIDATION", ".git", "__pycache__", "*.bak", "*.bak-*",
                 "positions.json*", "报告", "日志", "config.json", "最新推送.md", "*.log"))
             self.write_runtime_config(config)
             store.archive("runtime/" + SHORT, self.runtime / SHORT, now)
@@ -200,31 +225,56 @@ class Bot:
         spec = importlib.util.spec_from_file_location("go_bot_market", self.runtime / SHORT / "scripts" / "tail_momentum.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
+        if self._evidence is not None:
+            module.audit_event = self.record_evidence
         return module
 
     def market_env(self):
-        return self.market_module().em_market_env()
+        result = self.market_module().em_market_env()
+        if self._evidence is not None:
+            self.record_evidence("market_environment", result)
+        return result
 
     def quotes(self, codes):
-        return self.market_module().tencent_quotes(codes) if codes else {}
+        result = self.market_module().tencent_quotes(codes) if codes else {}
+        if self._evidence is not None:
+            self.record_evidence("execution_quotes", {"requested": codes, "quotes": result})
+        return result
 
     def exit_indicators(self, codes, now):
         if not codes or now.strftime("%H%M") < "0940":
             return {}
         worker = (
-            "import contextlib,json,sys; from datetime import datetime; from bot import Bot; "
+            "import contextlib,json,sys; from datetime import datetime; from bot import Bot,Recorder; "
             "request=json.load(sys.stdin); "
             "\nwith contextlib.redirect_stdout(sys.stderr):\n"
-            " result=Bot(request['home']).collect_exit_indicators(request['codes'],datetime.fromisoformat(request['now']))\n"
-            "print(json.dumps(result,ensure_ascii=False,allow_nan=False))"
+            " bot=Bot(request['home']); errors=[]\n"
+            " if request.get('evidence'):\n"
+            "  try:\n"
+            "   bot._evidence=Recorder(request['evidence'])\n"
+            "   bot.record_evidence('worker_start',{'job':'indicators'})\n"
+            "  except Exception as error: errors.append(type(error).__name__)\n"
+            " result=bot.collect_exit_indicators(request['codes'],datetime.fromisoformat(request['now']))\n"
+            " if bot._evidence is not None:\n"
+            "  bot.record_evidence('worker_end',{'returncode':0,'errors':bot._evidence.errors})\n"
+            "  errors+=bot._evidence.errors\n"
+            "print(json.dumps({'indicators':result,'evidence_errors':errors},ensure_ascii=False,allow_nan=False))"
         )
         try:
             completed = subprocess.run([sys.executable, "-X", "utf8", "-c", worker],
-                                       input=json.dumps({"home": str(self.home), "codes": codes, "now": now.isoformat()}),
+                                       input=json.dumps({"home": str(self.home), "codes": codes, "now": now.isoformat(),
+                                                         "evidence": str(self._evidence.directory) if self._evidence is not None else None}),
                                        cwd=str(Path(__file__).resolve().parent), capture_output=True, text=True,
                                        encoding="utf-8", timeout=35, check=True)
-            return json.loads(completed.stdout)
-        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, OSError):
+            response = json.loads(completed.stdout)
+            if self._evidence is not None:
+                for name in response["evidence_errors"]:
+                    if name not in self._evidence.errors:
+                        self._evidence.errors.append(name)
+            return response["indicators"]
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, OSError) as error:
+            if self._evidence is not None:
+                self.record_evidence("indicator_unavailable", {"codes": codes, "error_type": type(error).__name__})
             return {code: {"data_missing": True, "err": "技术指标超时或不可用，仅按有效价格规则判断"} for code in codes}
 
     def collect_exit_indicators(self, codes, now):
@@ -252,6 +302,10 @@ class Bot:
                     result[code]["err"] = "成交额为估算值，禁用VWAP规则"
             except (ValueError, TypeError, KeyError, OSError):
                 result[code] = {"data_missing": True, "err": "技术指标读取失败，仅评估有效价格规则"}
+        if self._evidence is not None:
+            for name in getattr(engine, "AUDIT_ERRORS", []):
+                if name not in self._evidence.errors:
+                    self._evidence.errors.append(name)
         return result
 
     def paper_report(self, job, now, result):
@@ -291,6 +345,11 @@ class Bot:
             raise RuntimeError("仅报告模式禁止处理非空持仓；请人工核验隔离账本。")
         if job.mode in ("week", "month", "auction", "exit"):
             return
+        if job.mode in ("scan", "pm"):
+            with self.research() as store:
+                campaign = verify_campaign(self.validation_root, store.version(now), self.validation_paths())
+            if campaign is not None and now < datetime.fromisoformat(campaign["started_at"]):
+                raise RuntimeError("不能在冻结验证开始之前登记样本。")
         if not fresh(self.market_env(), now, max_age=900 if job.mode == "ksnap" else 300):
             raise RuntimeError("无当日完整、新鲜指数行情；跳过任务，不以缺失时间戳放行。")
         if job.mode == "pm":
@@ -364,6 +423,21 @@ class Bot:
             return {"status": "unknown", "error": "推送响应无法解析；不自动重发"}
         return {"status": "sent", "at": datetime.now(CST).isoformat()}
 
+    def validation_health(self, job):
+        if self._evidence is None:
+            health = {"status": "incomplete", "errors": ["RecorderUnavailable"]}
+        else:
+            health = self._evidence.health()
+            if job.mode in ("scan", "pm"):
+                events = self._evidence.summary() if health["status"] == "ok" else []
+                required = {job.mode + "_final", "config", "http", "worker_end"}
+                if not required.issubset({event["kind"] for event in events}):
+                    health = {"status": "incomplete", "errors": ["SelectionTraceMissing"]}
+            health["path"] = str(self._evidence.directory)
+        if job.mode in ("scan", "pm") and (self.validation_root / "campaign.json").exists() and health["status"] != "ok":
+            raise RuntimeError("前向验证输入留存不完整，禁止新增模拟样本。")
+        return health
+
     def execute(self, job, now, state):
         key = now.strftime("%Y-%m-%d") + "/" + job.name
         if key in state["jobs"]:
@@ -374,6 +448,15 @@ class Bot:
         version = None
         result = {"status": "failed", "at": now.isoformat()}
         try:
+            if job.mode not in ("status", "week", "month"):
+                try:
+                    directory = self.validation_root / "runs" / f"{now:%Y-%m-%d}" / f"{job.name}_{started_ns}"
+                    self._evidence = Recorder(directory)
+                    self.record_evidence("run_start", {"job": job.name, "scheduled_at": now.isoformat()})
+                except Exception:
+                    self._evidence = None
+                    if job.mode in ("scan", "pm") and (self.validation_root / "campaign.json").exists():
+                        raise RuntimeError("验证证据目录不可写，禁止新增模拟样本。")
             self.archive_runtime(job, now)
             self.guard(job, now, state)
             log_file = self.home / "logs" / f"{now:%Y-%m-%d}_{job.name}.log"
@@ -394,6 +477,9 @@ class Bot:
                         stamp = datetime.strptime(indicator["last_bar"], "%Y-%m-%d %H:%M").replace(tzinfo=CST)
                         if not 0 <= (observed - stamp).total_seconds() <= 900:
                             indicators[code] = {"data_missing": True, "err": "实际观察时指标已过期，禁用技术规则"}
+                if self._evidence is not None:
+                    self.record_evidence("decision_input", {"quotes": quotes, "indicators": indicators,
+                                                            "observed_at": observed.isoformat()})
                 with self.research() as store:
                     if job.mode == "paper_settle":
                         result["paper"] = store.settle(quotes, observed)
@@ -411,14 +497,22 @@ class Bot:
             else:
                 env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8",
                            SHORT_TERM_BASE=str(self.runtime / SHORT))
+                command = self.command(job, now)
+                if self._evidence is not None and job.mode in ("scan", "pm", "ksnap"):
+                    command = command[:3] + [str(HOME.parent / "VALIDATION" / "run.py"), "capture",
+                                             "--engine", command[3], "--evidence", str(self._evidence.directory),
+                                             "--", *command[4:]]
                 with log_file.open("wb") as output:
-                    completed = subprocess.run(self.command(job, now), cwd=str(self.home), env=env,
+                    completed = subprocess.run(command, cwd=str(self.home), env=env,
                                                stdout=output, stderr=subprocess.STDOUT, timeout=600, check=False)
                 if completed.returncode:
                     raise RuntimeError(f"脚本退出码 {completed.returncode}，详见 {log_file}")
             if job.mode == "scan":
                 path = self.runtime / SHORT / "报告" / f"候选_{now:%Y-%m-%d}.json"
                 data = read(path, {})
+                if self._evidence is not None:
+                    self.record_evidence("candidates_file", {"raw": path.read_bytes()})
+                result["validation"] = self.validation_health(job)
                 if (not data.get("validations") or data.get("date") != now.date().isoformat()
                         or path.stat().st_mtime_ns < started_ns
                         or failed(data["validations"])):
@@ -432,10 +526,21 @@ class Bot:
                     raise RuntimeError("未生成本次确认文件，不登记模拟样本。")
                 signal = read(path, {})
                 quotes = self.quotes([r["code"] for r in signal.get("confirmed", [])])
+                if self._evidence is not None:
+                    self.record_evidence("signals_file", {"raw": path.read_bytes()})
+                result["validation"] = self.validation_health(job)
                 with self.research() as store:
-                    if version != store.version(self.clock()):
+                    observed = self.clock()
+                    current_version = store.version(observed)
+                    if version != current_version:
                         raise RuntimeError("执行期间版本变化，不登记模拟样本。")
-                    result["paper"] = store.enter(version, signal, quotes, self.clock())
+                    campaign = verify_campaign(self.validation_root, current_version, self.validation_paths())
+                    if campaign is not None:
+                        scan_trace = state["jobs"][f"{now:%Y-%m-%d}/scan"].get("validation", {}).get("path")
+                        if not scan_trace:
+                            raise RuntimeError("缺少冻结初筛证据，禁止新增模拟样本。")
+                        selection_chain(scan_trace, self._evidence.directory, signal)
+                    result["paper"] = store.enter(version, signal, quotes, observed)
                 state["jobs"][key] = result
                 dump(self.state_file, state)
                 result["research_report"] = self.paper_report(job, now, result["paper"])
@@ -468,6 +573,16 @@ class Bot:
                 result["notification"] = self.notify(job, now, started_ns)
             except (ValueError, OSError):
                 result["notification"] = {"status": "failed", "error": "推送配置或报告读取失败；不自动重发"}
+        if self._evidence is not None:
+            self.record_evidence("run_end", {"job": job.name, "status": result["status"],
+                                              "version": version, "paper": result.get("paper"),
+                                              "evidence_errors": self._evidence.errors})
+            try:
+                self._evidence.seal()
+                result["validation"] = {**self._evidence.health(), "path": str(self._evidence.directory)}
+            except Exception as error:
+                result["validation"] = {"status": "incomplete", "errors": [type(error).__name__]}
+        self._evidence = None
         state["jobs"][key] = result
         dump(self.state_file, state)
         self.event(job=job.name, **result)
@@ -498,6 +613,8 @@ def main():
     action.add_argument("--research-report", choices=["all", "week", "month"], help="本地生成版本对比报告，不联网、不推送")
     action.add_argument("--update", action="store_true", help="把仓库中的策略代码与参数同步到运行副本，保留累计数据")
     action.add_argument("--run", choices=[j.name for j in JOBS] + ["status"])
+    action.add_argument("--validation-start", action="store_true", help="冻结当前版本并开始前向模拟验证，不联网、不推送")
+    action.add_argument("--validation-report", action="store_true", help="只读证据和模拟账本，输出前向验证进度，不联网、不推送")
     parser.add_argument("--date", help="仅 --plan 可用，YYYY-MM-DD")
     args = parser.parse_args()
     if args.date and not args.plan:
@@ -511,6 +628,18 @@ def main():
             if not acquired:
                 raise RuntimeError("机器人正在执行，稍后再更新。")
             print(json.dumps(bot.update(now), ensure_ascii=False, indent=2))
+    elif args.validation_start or args.validation_report:
+        if not bot.runtime.is_dir() or not bot.state_file.is_file():
+            raise RuntimeError("先完成机器人隔离初始化。")
+        with lock(bot.home / "bot.lock") as acquired:
+            if not acquired:
+                raise RuntimeError("机器人正在执行，未变更验证数据。")
+            if args.validation_start:
+                result = bot.validation_start(now)
+            else:
+                from VALIDATION.assess import assess, save_report
+                result = save_report(assess(bot.home, now), bot.validation_root / "reports")
+            print(json.dumps(result, ensure_ascii=False, indent=2))
     elif args.research_init or args.research_report:
         if not bot.runtime.is_dir() or not bot.state_file.is_file():
             raise RuntimeError("先完成机器人隔离初始化。")

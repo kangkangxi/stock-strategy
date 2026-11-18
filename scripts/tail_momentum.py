@@ -195,17 +195,41 @@ def read_json(path, default=None):
         return default
 
 
+AUDIT_ERRORS = []
+
+
+def audit_event(kind, data):
+    return None
+
+
+def audit_emit(kind, data):
+    try:
+        audit_event(kind, data)
+    except Exception as error:
+        name = type(error).__name__
+        if name not in AUDIT_ERRORS:
+            AUDIT_ERRORS.append(name)
+
+
 def http_get(url, ref=None, enc="utf-8", timeout=15, retries=3):
     last = None
     for i in range(retries):
+        started = datetime.now().astimezone().isoformat()
         try:
             h = dict(UA)
             if ref:
                 h["Referer"] = ref
             req = urllib.request.Request(url, headers=h)
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return r.read().decode(enc, "ignore")
+                raw = r.read()
+            audit_emit("http", {"url": url, "encoding": enc, "attempt": i + 1,
+                                 "started_at": started, "received_at": datetime.now().astimezone().isoformat(),
+                                 "raw": raw})
+            return raw.decode(enc, "ignore")
         except Exception as e:  # noqa: BLE001
+            audit_emit("http", {"url": url, "encoding": enc, "attempt": i + 1,
+                                 "started_at": started, "received_at": datetime.now().astimezone().isoformat(),
+                                 "error_type": type(e).__name__})
             last = e
             if i < retries - 1:
                 time.sleep(0.6 * (i + 1))
@@ -2742,12 +2766,15 @@ def stage1_filter(rows, cfg, clock):
     for r in rows:
         if not r["code"] or r["price"] is None or not r["pct"]:
             dropped["停牌无价"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "停牌无价"})
             continue
         if is_st(r["name"]):
             dropped["ST/风险警示"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "ST/风险警示"})
             continue
         if board_of(r["code"]) in cfg["exclude_boards"]:
             dropped["板块排除"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "板块排除"})
             continue
         ld = r.get("list_date") or ""
         if len(ld) == 8:
@@ -2755,23 +2782,29 @@ def stage1_filter(rows, cfg, clock):
                 d0 = datetime.strptime(ld, "%Y%m%d").date()
                 if (today - d0).days < cfg["exclude_new_days"]:
                     dropped["次新"] += 1
+                    audit_emit("stage1", {"row": r, "passed": False, "reason": "次新"})
                     continue
             except ValueError:
                 pass
         if not (cfg["pct_low"] <= r["pct"] <= cfg["pct_high"]):
             dropped["涨幅区间"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "涨幅区间"})
             continue
         if (r.get("amount") or 0) < cfg["min_amount_yi"] * 1e8:
             dropped["成交额"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "成交额"})
             continue
         to = r.get("turnover")
         if to is not None and not (cfg["min_turnover"] <= to <= cfg["max_turnover"]):
             dropped["换手率"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "换手率"})
             continue
         vr = r.get("vol_ratio")
         if vr is not None and vr > 0 and vr < cfg["min_volume_ratio"]:
             dropped["量比"] += 1
+            audit_emit("stage1", {"row": r, "passed": False, "reason": "量比"})
             continue
+        audit_emit("stage1", {"row": r, "passed": True, "reason": None})
         keep.append(r)
     return keep, dropped
 
@@ -2819,6 +2852,8 @@ def mode_scan(clock, cfg, args):
                 push_report(msg)
             return 1
     log(f"[scan] 涨幅榜（{clist_src}）返回 {len(rows)} 行（全市场 {market_total} 只）")
+    audit_emit("scan_market", {"rows": rows, "market_total": market_total, "source": clist_src,
+                                "environment": env, "coverage": "fetched_rank_pages_only"})
     keep, dropped = stage1_filter(rows, cfg, clock)
     if clist_src == "东财":
         if market_total and 3000 <= market_total <= 8000:
@@ -2836,6 +2871,8 @@ def mode_scan(clock, cfg, args):
 
     codes = [r["code"] for r in picked]
     quotes = tencent_quotes(codes)
+    audit_emit("scan_rank", {"picked": picked, "not_analyzed": keep[len(picked):],
+                              "reason": "max_candidates_analyze", "quotes": quotes})
     validations.append(f"{'✅' if len(quotes) >= len(codes) * 0.9 else '⚠️'} 腾讯行情覆盖 {len(quotes)}/{len(codes)}")
 
     env["industry_strong"] = {}
@@ -2852,9 +2889,12 @@ def mode_scan(clock, cfg, args):
                 c = fut.result()
             except Exception as e:  # noqa: BLE001
                 log(f"[warn] {r['code']} 分析异常：{e}")
+                audit_emit("scan_analysis", {"code": r["code"], "outcome": "exception",
+                                              "error_type": type(e).__name__})
                 continue
             if c.get("skip"):
                 log(f"[warn] {r['code']} {r['name']} 跳过：{'；'.join(c.get('errors', []))}")
+                audit_emit("scan_analysis", {"code": r["code"], "outcome": "skipped", "result": c})
                 continue
             q = quotes.get(c["code"]) or {}
             c["price"] = q.get("price") or r["price"]
@@ -2869,6 +2909,7 @@ def mode_scan(clock, cfg, args):
             c["scenarios"] = scenarios_text(c["plan"], c["m10"], {"price": c["price"]})
             if not c.get("tradable"):
                 c["primary_fail"] = (c.get("hard_fail") or ["条件不足"])[0]
+            audit_emit("scan_analysis", {"code": r["code"], "outcome": "analyzed", "result": c})
             results.append(c)
 
     results.sort(key=lambda x: -x["total"])
@@ -2901,6 +2942,8 @@ def mode_scan(clock, cfg, args):
         notes.append("❌ **数据校验未通过（关键项失败）**：本轮不出交易名单，请勿采信排序。")
         tradable = []
 
+    audit_emit("scan_final", {"tradable": [c["code"] for c in tradable], "critical": bool(critical),
+                               "results": results, "validations": validations, "environment": env})
     mode_label = "14:30 尾盘强势股筛选"
     md = build_md_report(clock, cfg, env, results, stage1_count, validations, mode_label, notes)
     os.makedirs(REPORT_DIR, exist_ok=True)
@@ -3208,6 +3251,7 @@ def mode_pm(clock, cfg, args):
         env = em_market_env()
     except Exception:  # noqa: BLE001
         env = {}
+    audit_emit("pm_input", {"candidates": data, "quotes": quotes, "environment": env})
     confirmed, rejected, nodata = [], [], []
     src_used, src_notes = {}, []
     for c in cands:
@@ -3269,11 +3313,15 @@ def mode_pm(clock, cfg, args):
                "launch_gain": (c.get("m10") or {}).get("launch_gain"),
                "scan_pct": c.get("pct"), "scan_vol_ratio": c.get("vol_ratio"),
                "daily": c.get("daily")}
+        audit_emit("pm_evaluation", {"code": c["code"], "result": rec,
+                                      "outcome": "passed" if data_ok and not reasons else "rejected" if data_ok else "missing_data"})
         (confirmed if (data_ok and not reasons) else (rejected if data_ok else nodata)).append(rec)
     confirmed.sort(key=lambda x: -(x.get("score") or 0))
     limit = int(cfg.get("max_buy_list", 5))
     overflow = confirmed[limit:]
     confirmed = confirmed[:limit]
+    audit_emit("pm_final", {"confirmed": confirmed, "rejected": rejected, "nodata": nodata,
+                             "overflow": overflow, "overflow_reason": "max_buy_list"})
     if overflow:
         log(f"[pm] 通过条件超过上限 {limit} 只，按评分截断 {len(overflow)} 只")
 
@@ -3447,6 +3495,7 @@ def main():
     cfg = load_cfg()
     if args.no_push:
         cfg["push"] = False
+    audit_emit("config", {"effective": cfg, "clock": clock.isoformat(), "mode": args.mode})
     os.makedirs(REPORT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
 

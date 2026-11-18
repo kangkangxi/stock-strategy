@@ -130,6 +130,91 @@ class BotTests(unittest.TestCase):
                 self.assertNotIn("--hold", command)
                 self.assertNotIn("--close", command)
 
+    def test_validation_start_is_frozen_and_idempotent(self):
+        first = self.bot.validation_start(self.now)
+        path = self.bot.validation_root / "campaign.json"
+        original = path.read_bytes()
+        second = self.bot.validation_start(self.now + timedelta(days=1))
+        self.assertEqual(first["campaign_id"], second["campaign_id"])
+        self.assertEqual(original, path.read_bytes())
+        cfg = read(self.home / "research_config.json", {})
+        cfg["commission_min"] += 1
+        dump(self.home / "research_config.json", cfg)
+        with self.assertRaises(RuntimeError):
+            self.bot.validation_start(self.now)
+        self.assertEqual(original, path.read_bytes())
+
+    def test_validation_drift_blocks_new_scan_before_network_but_not_exit(self):
+        self.bot.validation_start(self.now)
+        config = self.bot.runtime / SHORT / "config.json"
+        cfg = read(config, {})
+        cfg["pct_low"] = 5
+        dump(config, cfg)
+        with patch.object(self.bot, "market_env") as market:
+            with self.assertRaisesRegex(RuntimeError, "冻结"):
+                self.bot.guard(next(j for j in JOBS if j.mode == "scan"), self.now, self.state)
+            self.bot.guard(next(j for j in JOBS if j.mode == "exit"), self.now, self.state)
+            market.assert_not_called()
+
+    def test_validation_disk_failure_blocks_entry_without_launching_scan(self):
+        self.bot.validation_start(self.now)
+        with patch("bot.Recorder", side_effect=OSError("fixture")), patch("bot.subprocess.run") as worker:
+            self.assertEqual(self.bot.run(self.now, next(j for j in JOBS if j.mode == "scan")), 1)
+            worker.assert_not_called()
+        with self.bot.research() as store:
+            self.assertEqual(store.open_codes(), [])
+
+    def test_validation_missing_selection_trace_blocks_new_sample(self):
+        from VALIDATION.evidence import Recorder
+        self.bot.validation_start(self.now)
+        self.bot._evidence = Recorder(self.bot.validation_root / "test")
+        with self.assertRaisesRegex(RuntimeError, "留存不完整"):
+            self.bot.validation_health(next(j for j in JOBS if j.mode == "pm"))
+        self.bot._evidence.event("pm_final", {"confirmed": []})
+        with self.assertRaises(RuntimeError):
+            self.bot.validation_health(next(j for j in JOBS if j.mode == "pm"))
+        for kind in ("config", "http", "worker_end"):
+            self.bot._evidence.event(kind, {"returncode": 0, "errors": []})
+        self.assertEqual(self.bot.validation_health(next(j for j in JOBS if j.mode == "pm"))["status"], "ok")
+
+    def test_collector_drift_during_confirmation_blocks_entry(self):
+        at = self.now.replace(minute=51)
+        collector = self.home / "collector.py"
+        collector.write_text("before")
+        with patch.object(self.bot, "validation_paths", return_value={"collector": collector}):
+            campaign = self.bot.validation_start(self.now)
+            dump(self.bot.state_file, {"jobs": {
+                "2026-11-16/scan": {"status": "done", "research_version": campaign["version"]},
+                "2026-11-16/paper_settle": {"status": "done"}}})
+            reports = self.bot.runtime / SHORT / "报告"
+            dump(reports / "候选_2026-11-16.json", {"date": "2026-11-16", "validations": ["passed"]})
+            def child(*args, **kwargs):
+                dump(reports / "买入清单_2026-11-16.json", {
+                    "date": "2026-11-16", "generated": "2026-11-16 14:51", "confirmed": []})
+                for kind in ("config", "http", "pm_final", "worker_end"):
+                    self.bot.record_evidence(kind, {"returncode": 0, "errors": []})
+                collector.write_text("after")
+                return subprocess.CompletedProcess([], 0)
+            market = {"ts": at.timestamp(), "indices": [{"code": "000001", "price": 3600}]}
+            with patch.object(self.bot, "market_env", return_value=market), patch.object(self.bot, "quotes", return_value={}), \
+                    patch.object(self.bot, "clock", return_value=at), patch("bot.subprocess.run", side_effect=child), \
+                    patch("bot.Research.enter") as enter:
+                self.assertEqual(self.bot.run(at, next(j for j in JOBS if j.mode == "pm")), 1)
+                enter.assert_not_called()
+
+    def test_evidence_event_and_health_faults_do_not_block_exit(self):
+        at = self.now.replace(hour=10, minute=0)
+        paper = {"decisions": [], "closed": 0, "reduced": 0, "deferred": 0}
+        with patch.object(self.bot, "quotes", return_value={}), patch.object(self.bot, "exit_indicators", return_value={}), \
+                patch.object(self.bot, "clock", return_value=at), patch("bot.Research.monitor", return_value=paper) as monitor, \
+                patch("bot.Recorder.event", side_effect=OSError("fixture")), patch("bot.Recorder.health", side_effect=RuntimeError("fixture")), \
+                patch.object(self.bot, "notify", return_value={"status": "disabled"}):
+            self.assertEqual(self.bot.run(at, next(j for j in JOBS if j.name == "exit_1000")), 0)
+            monitor.assert_called_once()
+        result = read(self.bot.state_file, {})["jobs"]["2026-11-16/exit_1000"]
+        self.assertEqual(result["validation"]["status"], "incomplete")
+        self.assertEqual(result["status"], "done")
+
     def test_lock(self):
         path = self.home / "test.lock"
         with lock(path) as acquired:
@@ -507,6 +592,25 @@ class BotTests(unittest.TestCase):
         self.assertEqual(data["600000"]["ma5_last"], 10)
         self.assertEqual(data["600000"]["vwap"], 10)
         self.assertEqual(data["600000"]["source"], "fixture")
+
+    def test_indicator_evidence_initialization_failure_keeps_indicators(self):
+        from VALIDATION.evidence import Recorder
+        at = self.now.replace(hour=10, minute=0)
+        script = self.bot.runtime / SHORT / "scripts" / "tail_momentum.py"
+        script.write_text(
+            "def fetch_5m(code, now, today, lmt):\n"
+            " return [{'t': today+' 10:00', 'c': 10, 'v': 100, 'amt': 100000}], 'fixture', 'ok', [], []\n"
+            "def build_10m(bars, now):\n return bars\n"
+            "def ma(values, period):\n return 10\n", encoding="utf-8")
+        self.bot._evidence = Recorder(self.home / "validation" / "fixture")
+        blocked = self.home / "blocked"
+        blocked.write_text("file, not directory")
+        self.bot._evidence.directory = blocked
+        data = self.bot.exit_indicators(["600000"], at)
+        self.assertFalse(data["600000"]["data_missing"])
+        self.assertEqual(data["600000"]["ma5_last"], 10)
+        self.assertEqual(data["600000"]["vwap"], 10)
+        self.assertIn("FileExistsError", self.bot._evidence.errors)
 
     def test_technical_fetch_has_total_deadline(self):
         at = self.now.replace(hour=10, minute=0)
