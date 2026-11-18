@@ -17,6 +17,13 @@ GO_BOT/bot.lock
 GO_BOT/push_config.json
 GO_BOT/research_config.json
 
+# ── 独立回测本机数据与推送回执，禁止提交 ──
+BACKTEST/data/
+BACKTEST/cache/
+BACKTEST/reports/
+BACKTEST/notifications/
+BACKTEST/config.json
+
 # ── 密钥与凭据 ──
 .env
 .env.*
