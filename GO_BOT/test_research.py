@@ -561,7 +561,8 @@ class ResearchTests(unittest.TestCase):
                 result = r.settle(quotes, later)
                 self.assertEqual((result["closed"], result["deferred"]), (0, 1))
                 self.assertEqual(r.account(version), before)
-                self.assertEqual([event["kind"] for event in r.events(version)], ["open", "defer"])
+                self.assertEqual([event["kind"] for event in r.events(version)], ["open", "decision", "defer"])
+                self.assertEqual(r.events(version)[-2]["action"], "defer")
                 self.assertTrue(r.events(version)[-1]["reason"])
                 row = self.report_row(r.report("all", later), version)
                 self.assertEqual(row["cumulative"]["n"], 0)
@@ -591,7 +592,7 @@ class ResearchTests(unittest.TestCase):
                             self.assertEqual((result["closed"], result["deferred"]), (0, 1))
                             self.assertEqual(r.events(version)[-1]["kind"], "defer")
                         self.assertEqual(r.account(version), before)
-                        self.assertEqual(self.counts(r)["events"], counts["events"] + 1)
+                        self.assertEqual(self.counts(r)["events"], counts["events"] + (2 if side == "sell" else 1))
                         self.assertEqual(self.counts(r)["runs"], counts["runs"] + 1)
                         raw = r.object(result["input_object"])
                         recorded = json.loads(raw)
@@ -974,6 +975,549 @@ class ResearchTests(unittest.TestCase):
                     self.assertEqual(r.enter(version, self.signal(now), self.quotes(now), now)["opened"], 1)
                 else:
                     self.assertEqual(r.settle(self.quotes(now), now)["closed"], 1)
+
+    def planned_open(self, r=None, version=None, now=None, code="600001", stop=9, prev_close=10):
+        r, version, now = r or self.r, version or self.v, now or self.now
+        signal = self.signal(now, (code,))
+        signal["confirmed"][0]["plan"] = {"stop": stop, "note": "冻结计划"}
+        quotes = {code: self.quote(code, now, prev_close=prev_close)}
+        self.assertEqual(r.enter(version, signal, quotes, now)["opened"], 1)
+        return next(iter(r.account(version)["positions"].values()))
+
+    @staticmethod
+    def technical(ma5=10, vwap=10, **changes):
+        return {"600001": {"ma5_last": ma5, "vwap": vwap, **changes}}
+
+    def test_schema2_and_exact_legacy_rules_are_declared(self):
+        self.assertEqual(research.LEGACY_RULES, {
+            "schema": 1, "entry": "confirmed_then_fresh_quote_1451_1456",
+            "exit": "first_observed_later_weekday_1451_1456",
+            "quote_max_age_seconds": 120, "signal_max_age_seconds": 300,
+            "fill": "last_price_with_adverse_slippage_no_orderbook_guarantee",
+            "lot": "688_minimum_200_other_mainland_minimum_100_multiples_100",
+            "net_return_denominator": "buy_amount_plus_buy_fees",
+            "calendar": "observed_sessions_only_missing_weekdays_flagged_not_assumed_holidays",
+        })
+        self.assertEqual(research.RULES["schema"], 2)
+        self.assertIn("1451", research.RULES["exit"])
+        self.assertIn("ma5", research.RULES["reduce"])
+
+    def test_entry_freezes_plan_prev_close_and_original_shares(self):
+        signal = self.signal(self.now)
+        signal["confirmed"][0]["plan"] = {"stop": 9.2, "targets": [11, 12]}
+        quotes = {"600001": self.quote("600001", self.now, prev_close=9.8)}
+        self.r.enter(self.v, signal, quotes, self.now)
+        saved = self.r.events(self.v)[0]
+        signal["confirmed"][0]["plan"]["targets"].append(999)
+        quotes["600001"]["prev_close"] = 999
+        self.assertEqual(saved["plan"], {"stop": 9.2, "targets": [11, 12]})
+        self.assertEqual(saved["prev_close"], 9.8)
+        self.assertEqual(saved["shares"], saved["initial_shares"])
+        self.assertEqual(saved["shares"], saved["remaining_shares"])
+        self.assertEqual(self.r.events(self.v)[0], saved)
+
+    def test_auction_observes_without_open_volume_or_limits_and_never_fills(self):
+        self.planned_open(stop=9.5)
+        before = self.r.account(self.v)
+        now = at("2026-11-03", "09:25:00")
+        quote = {"code": "600001", "time": now.strftime("%Y%m%d%H%M%S"), "price": 9}
+        result = self.r.monitor({"600001": quote}, {}, now, "auction")
+        self.assertEqual((result["closed"], result["reduced"], result["deferred"]), (0, 0, 0))
+        decision = result["decisions"][0]
+        self.assertEqual(decision["action"], "observe")
+        self.assertEqual(decision["price"], 9)
+        self.assertEqual(decision["sell_shares"], 0)
+        self.assertEqual(self.r.account(self.v), before)
+        self.assertEqual([e["kind"] for e in self.r.events(self.v)], ["open", "decision"])
+        snapshot = json.loads(self.r.object(result["input_object"]))
+        self.assertEqual(snapshot["slot"], "auction")
+        self.assertEqual(snapshot["quotes"], {"600001": quote})
+
+    def test_auction_rejects_bad_code_time_day_and_nonfinite_price_without_fills(self):
+        now = at("2026-11-03", "09:26:00")
+        for index, changes in enumerate(({"code": "600002"}, {"time": "bad"}, {"time": "20261102092500"},
+                                         {"time": "20261103092459"}, {"time": "20261103092601"},
+                                         {"price": float("nan")}, {"price": float("inf")}, {"price": 0})):
+            with self.subTest(changes=changes):
+                r, version = self.book(f"bad_auction_{index}")
+                self.planned_open(r, version)
+                before = r.account(version)
+                quote = {"code": "600001", "time": now.strftime("%Y%m%d%H%M%S"), "price": 10, **changes}
+                result = r.monitor({"600001": quote}, {}, now, "auction")
+                self.assertEqual(result["decisions"][0]["action"], "defer")
+                self.assertEqual(result["deferred"], 1)
+                self.assertEqual(r.account(version), before)
+
+    def test_opening_stop_sells_without_technical_indicators(self):
+        position = self.planned_open(stop=9.5)
+        now = at("2026-11-03", "09:30:00")
+        result = self.r.monitor(self.quotes(now, price=9.5), {}, now, "opening")
+        decision = result["decisions"][0]
+        self.assertEqual((decision["action"], decision["reason_id"], result["closed"]), ("sell", "plan_stop", 1))
+        self.assertEqual(decision["sell_shares"], position["shares"])
+        self.assertEqual(decision["remaining_shares"], 0)
+        self.assertEqual(decision["sell_ratio"], 1)
+        self.assertTrue(any("技术指标缺失" in text for text in decision["reasons"]))
+        self.assertEqual(decision["decision_version"], self.v)
+        trade = self.r.account(self.v)["closed"][0]
+        self.assertEqual(trade["sell"], expected_execution(9.5, position["shares"], "sell", self.r.spec(self.v)["paper_config"]))
+
+    def test_hold_saves_complete_append_only_decision_and_inputs(self):
+        position = self.planned_open()
+        before = self.r.account(self.v)
+        now = at("2026-11-03", "10:00:00")
+        quotes = {"600001": self.quote("600001", now, price=10.5, open=10.2, high=10.6)}
+        indicators = self.technical(ma5=10, vwap=10.2)
+        result = self.r.monitor(quotes, indicators, now, "1000")
+        decision = result["decisions"][0]
+        for field in ("position_id", "code", "name", "version", "action", "reasons", "scenario", "quote_time",
+                      "price", "shares_before", "sell_shares", "remaining_shares", "sell_ratio", "entry_date", "plan", "input_object", "decision_version"):
+            self.assertIn(field, decision)
+        self.assertEqual(decision["action"], "hold")
+        self.assertEqual(decision["scenario"], "A")
+        self.assertEqual(self.r.account(self.v), before)
+        self.assertEqual(position["plan"], decision["plan"])
+        recorded = json.loads(self.r.object(result["input_object"]))
+        self.assertEqual(recorded["indicators"], indicators)
+        self.assertEqual(recorded["quotes"], quotes)
+        with self.r.db:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "append-only"):
+                self.r.db.execute("UPDATE events SET data='{}' WHERE kind='decision'")
+
+    def test_gap_scenarios_and_full_exit_priority(self):
+        cases = [(10.5, 10.3, "A", "hold"), (10.5, 9.8, "B", "sell"),
+                 (10, 10, "C", "hold"), (9.8, 9.7, "D", "sell"), (9.8, 9.9, "E", "hold")]
+        now = at("2026-11-03", "10:00:00")
+        for index, (opening, price, scenario, action) in enumerate(cases):
+            with self.subTest(scenario=scenario):
+                r, version = self.book(f"gap_case_{index}")
+                self.planned_open(r, version, stop=9)
+                quote = self.quote("600001", now, price=price, open=opening, prev_close=10)
+                result = r.monitor({"600001": quote}, {}, now, "1000")
+                self.assertEqual(result["decisions"][0]["scenario"], scenario)
+                self.assertEqual(result["decisions"][0]["action"], action)
+                if action == "sell":
+                    self.assertEqual(result["decisions"][0]["reason_id"], "gap_" + scenario)
+
+    def test_half_exact_shares_cash_fees_and_original_open_is_unchanged(self):
+        position = self.planned_open()
+        original = self.r.events(self.v)[0]
+        now = at("2026-11-03", "10:00:00")
+        result = self.r.monitor(self.quotes(now, price=10), self.technical(10.2, 10.1), now, "1000")
+        decision = result["decisions"][0]
+        shares = position["shares"] // 200 * 100
+        self.assertEqual(position["shares"], 1900)
+        self.assertEqual((result["reduced"], decision["sell_shares"], decision["remaining_shares"]), (1, 900, 1000))
+        sale = self.r.events(self.v)[-1]
+        cfg = self.r.spec(self.v)["paper_config"]
+        expected = expected_execution(10, shares, "sell", cfg)
+        self.assertEqual(sale["kind"], "partial_sell")
+        self.assertEqual(sale["sell"], expected)
+        account = self.r.account(self.v)
+        self.assertEqual(account["cash"], float(cents(cfg["initial_cash"]) - cents(position["buy"]["cash"]) + cents(expected["cash"])))
+        remaining = next(iter(account["positions"].values()))
+        self.assertEqual(remaining["shares"], position["shares"])
+        self.assertEqual(remaining["remaining_shares"], 1000)
+        self.assertEqual(remaining["cumulative_sell"], expected)
+        self.assertFalse(account["closed"])
+        self.assertEqual(self.r.events(self.v)[0], original)
+        row = self.report_row(self.r.report("week", now), self.v)
+        self.assertEqual(row["period"]["n"], 0)
+        self.assertIsNone(row["period"]["win_rate"])
+        self.assertEqual(row["partial_sale_count"], 1)
+        self.assertEqual(row["open_partial_realized_pnl"], sale["sale_pnl"])
+
+    def test_partial_reason_once_per_day_and_slot_replay_is_idempotent(self):
+        self.planned_open()
+        now = at("2026-11-03", "10:00:00")
+        first = self.r.monitor(self.quotes(now), self.technical(10.2, 10.1), now, "1000")
+        before, counts = self.r.account(self.v), self.counts()
+        self.assertEqual(self.r.monitor({}, {}, now + timedelta(minutes=1), "1000"), first)
+        self.assertEqual(self.counts(), counts)
+        later = now + timedelta(minutes=30)
+        second = self.r.monitor(self.quotes(later), self.technical(10.2, 10.1), later, "1030")
+        self.assertEqual(second["decisions"][0]["action"], "hold")
+        self.assertTrue(any("同一减仓原因已执行" in text for text in second["decisions"][0]["reasons"]))
+        self.assertEqual(self.r.account(self.v), before)
+        next_day = now + timedelta(days=1)
+        third = self.r.monitor(self.quotes(next_day), self.technical(10.2, 10.1), next_day, "1000")
+        self.assertEqual(third["reduced"], 1)
+        self.assertEqual(third["decisions"][0]["sell_shares"], 500)
+        reopened = research.Research(self.home)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.monitor({}, {}, now, "1000"), first)
+
+    def test_partial_then_force_accumulates_all_fees_net_pnl_and_no_duplicate_cash(self):
+        for method in ("monitor", "settle"):
+            with self.subTest(method=method):
+                r, version = self.book("partial_force_" + method)
+                position = self.planned_open(r, version)
+                now = at("2026-11-03", "10:00:00")
+                r.monitor(self.quotes(now), self.technical(10.2, 10.1), now, "1000")
+                final = at("2026-11-03", "14:51:00")
+                result = (r.monitor(self.quotes(final, price=12), {}, final, "1451") if method == "monitor" else
+                          r.settle(self.quotes(final, price=12), final))
+                self.assertEqual(result["closed"], 1)
+                account = r.account(version)
+                trade = account["closed"][0]
+                cfg = r.spec(version)["paper_config"]
+                first = expected_execution(10, 900, "sell", cfg)
+                last = expected_execution(12, 1000, "sell", cfg)
+                total = {key: float(cents(first[key]) + cents(last[key])) for key in ("amount", "fee", "cash")}
+                total["price"] = float(Decimal(str(total["amount"])) / position["shares"])
+                pnl = cents(total["cash"]) - cents(position["buy"]["cash"])
+                self.assertEqual(trade["sell"], total)
+                self.assertEqual(trade["execution_sell"], last)
+                self.assertEqual(trade["shares"], 1900)
+                self.assertEqual(trade["sell_shares"], 1000)
+                self.assertEqual(trade["pnl"], float(pnl))
+                self.assertAlmostEqual(trade["net_pct"], float(pnl / cents(position["buy"]["cash"]) * 100))
+                self.assertEqual(account["cash"], float(cents(cfg["initial_cash"]) + pnl))
+                self.assertFalse(account["positions"])
+                report = r.report("week", final)
+                row = self.report_row(report, version)
+                self.assertEqual(row["period"]["fees"], float(cents(position["buy"]["fee"]) + cents(total["fee"])))
+                self.assertEqual(row["sale_count"], 2)
+                self.assertEqual(row["sale_realized_pnl"], float(pnl))
+                self.assertEqual(row["sale_details"][-1]["sell"], last)
+                self.assertEqual(row["sale_fees"], total["fee"])
+                self.assertEqual(row["open_partial_realized_pnl"], 0)
+                counts = self.counts(r)
+                if method == "monitor":
+                    self.assertEqual(r.monitor({}, {}, final, "1451"), result)
+                    self.assertEqual(r.settle(self.quotes(final), final)["closed"], 0)
+                else:
+                    self.assertEqual(r.settle({}, final), result)
+                    self.assertEqual(r.monitor(self.quotes(final), {}, final, "1451")["closed"], 0)
+                self.assertEqual(r.account(version), account)
+                self.assertEqual(self.counts(r)["events"], counts["events"])
+
+    def test_distinct_partial_reasons_can_reduce_but_total_execution_cash_is_not_repeated(self):
+        position = self.planned_open()
+        morning = at("2026-11-03", "10:00:00")
+        self.r.monitor(self.quotes(morning), self.technical(10.2, 10.1), morning, "1000")
+        later = morning + timedelta(minutes=30)
+        quote = self.quote("600001", later, price=10.5, open=10, high=11)
+        result = self.r.monitor({"600001": quote}, {}, later, "1030")
+        self.assertEqual(result["reduced"], 1)
+        self.assertEqual(result["decisions"][0]["reason_id"], "high_pullback")
+        self.assertEqual(result["decisions"][0]["sell_shares"], 500)
+        final = at("2026-11-03", "14:51:00")
+        self.r.settle(self.quotes(final, price=11), final)
+        account = self.r.account(self.v)
+        sells = [e.get("execution_sell", e.get("sell")) for e in self.r.events(self.v) if e["kind"] in ("partial_sell", "close")]
+        total_cash = sum(cents(s["cash"]) for s in sells)
+        self.assertEqual(account["cash"], float(cents(100000) - cents(position["buy"]["cash"]) + total_cash))
+        self.assertEqual(account["closed"][0]["sell"]["fee"], float(sum(cents(s["fee"]) for s in sells)))
+
+    def test_afternoon_weakness_half_and_force_priority(self):
+        self.planned_open()
+        now = at("2026-11-03", "14:00:00")
+        quote = self.quote("600001", now, price=10.05, open=10)
+        result = self.r.monitor({"600001": quote}, self.technical(10.1, 10), now, "1400")
+        self.assertEqual(result["decisions"][0]["reason_id"], "afternoon_weak")
+        self.assertEqual(result["reduced"], 1)
+        final = at("2026-11-03", "14:51:00")
+        result = self.r.monitor(self.quotes(final), self.technical(10.2, 10.1), final, "1451")
+        self.assertEqual(result["decisions"][0]["reason_id"], "force_1451")
+        self.assertEqual(result["closed"], 1)
+
+    def test_partial_mainland_and_688_lot_minimum_and_remainder_protection(self):
+        cases = [("600001", 1005, 100, 0), ("600001", 2005, 200, 100),
+                 ("600001", 3005, 300, 100), ("688001", 2005, 200, 0),
+                 ("688001", 3005, 300, 0), ("688001", 4005, 400, 200), ("688001", 5005, 500, 200)]
+        now = at("2026-11-03", "10:00:00")
+        for index, (code, allocation, total, sold) in enumerate(cases):
+            with self.subTest(code=code, total=total):
+                r, version = self.book(f"partial_lot_{index}", {"initial_cash": 10000, "allocation": allocation,
+                                          "slippage_pct": 0, "commission_rate": 0, "transfer_fee_rate": 0})
+                position = self.planned_open(r, version, code=code)
+                self.assertEqual(position["shares"], total)
+                result = r.monitor(self.quotes(now, (code,)), {code: {"ma5_last": 10.2, "vwap": 10.1}}, now, "1000")
+                self.assertEqual(result["decisions"][0]["sell_shares"], sold)
+                self.assertEqual(result["decisions"][0]["action"], "reduce" if sold else "hold")
+                final = at("2026-11-03", "14:51:00")
+                self.assertEqual(r.settle(self.quotes(final, (code,)), final)["closed"], 1)
+                self.assertEqual(r.account(version)["closed"][0]["shares"], total)
+
+    def test_missing_or_invalid_stop_holds_until_force_without_invented_risk(self):
+        now = at("2026-11-03", "10:00:00")
+        for index, stop in enumerate((None, 0, -1, "9", True, float("nan"), float("inf"))):
+            with self.subTest(stop=stop):
+                r, version = self.book(f"no_stop_{index}")
+                self.planned_open(r, version, stop=stop)
+                before = r.account(version)
+                result = r.monitor(self.quotes(now, price=8.5), self.technical(10, 10), now, "1000")
+                self.assertEqual(result["decisions"][0]["action"], "hold")
+                self.assertTrue(any("风险数据缺失" in text for text in result["decisions"][0]["reasons"]))
+                self.assertEqual(r.account(version), before)
+                final = at("2026-11-03", "14:51:00")
+                self.assertEqual(r.monitor(self.quotes(final, price=8.5), {}, final, "1451")["closed"], 1)
+
+    def test_absent_plan_and_gap_fields_hold_and_indicator_errors_are_audited(self):
+        self.open_one()
+        now = at("2026-11-03", "10:00:00")
+        result = self.r.monitor(self.quotes(now, price=9), self.technical(float("nan"), float("inf"), err="offline", data_missing=["ma5"]), now, "1000")
+        decision = result["decisions"][0]
+        self.assertEqual(decision["action"], "hold")
+        self.assertIsNone(decision["scenario"])
+        self.assertEqual(decision["plan"], {})
+        self.assertTrue(any("gap场景" in text for text in decision["reasons"]))
+        snapshot = json.loads(self.r.object(result["input_object"]))
+        self.assertEqual(snapshot["indicators"]["600001"]["ma5_last"], "nan")
+        self.assertEqual(snapshot["indicators"]["600001"]["vwap"], "inf")
+
+    def test_indicator_missing_or_error_disables_unreliable_ma_reductions(self):
+        now = at("2026-11-03", "10:00:00")
+        for index, indicator in enumerate(({}, {"ma5_last": 10.2}, {"ma5_last": 10.2, "vwap": 10.1, "err": "bad"},
+                                           {"ma5_last": 10.2, "vwap": 10.1, "data_missing": True},
+                                           {"ma5_last": float("inf"), "vwap": 10.1})):
+            with self.subTest(indicator=indicator):
+                r, version = self.book(f"indicator_missing_{index}")
+                self.planned_open(r, version)
+                result = r.monitor(self.quotes(now), {"600001": indicator}, now, "1000")
+                self.assertEqual(result["decisions"][0]["action"], "hold")
+                self.assertTrue(any("技术指标缺失" in text for text in result["decisions"][0]["reasons"]))
+
+    def test_monitor_invalid_quotes_always_defer_without_cash_or_position_change(self):
+        self.planned_open(stop=10)
+        before = self.r.account(self.v)
+        now = at("2026-11-03", "10:00:00")
+        for index, (name, quotes) in enumerate(self.invalid_quote_cases(now, "sell")):
+            with self.subTest(name=name):
+                result = self.r.monitor(quotes, self.technical(11, 11), now, f"bad_{index}")
+                self.assertEqual(result["decisions"][0]["action"], "defer")
+                self.assertEqual((result["closed"], result["reduced"], result["deferred"]), (0, 0, 1))
+                self.assertEqual(self.r.account(self.v), before)
+        self.assertFalse(any(e["kind"] == "partial_sell" for e in self.r.events()))
+
+    def test_monitor_nonfinite_quote_fields_defer_and_audit_without_nan_json(self):
+        self.planned_open(stop=10)
+        now = at("2026-11-03", "10:00:00")
+        before = self.r.account(self.v)
+        for field in ("price", "open", "vol", "limit_up", "limit_down"):
+            for index, value in enumerate((float("nan"), float("inf"), float("-inf"))):
+                with self.subTest(field=field, value=value):
+                    quotes = self.quotes(now)
+                    quotes["600001"][field] = value
+                    result = self.r.monitor(quotes, {}, now, f"invalid_{field}_{index}")
+                    self.assertEqual(result["decisions"][0]["action"], "defer")
+                    self.assertEqual(self.r.account(self.v), before)
+                    raw = self.r.object(result["input_object"])
+                    self.assertNotIn(b"NaN", raw)
+                    self.assertNotIn(b"Infinity", raw)
+                    self.assertEqual(json.loads(raw)["quotes"]["600001"][field], str(value))
+
+    def test_monitor_tplus1_holds_even_when_stop_and_force_trigger(self):
+        self.planned_open(stop=11)
+        before = self.r.account(self.v)
+        result = self.r.monitor(self.quotes(self.now), self.technical(11, 11), self.now, "1452")
+        self.assertEqual(result["decisions"][0]["action"], "hold")
+        self.assertTrue(any("T+1" in text for text in result["decisions"][0]["reasons"]))
+        self.assertEqual(self.r.account(self.v), before)
+        self.assertEqual(result["closed"], 0)
+
+    def test_monitor_rejects_weekends_lunch_wrong_timezone_and_slot_windows(self):
+        self.planned_open()
+        before, counts = self.r.account(self.v), self.counts()
+        times = [(at("2026-11-07", "10:00:00"), "1000"), (at("2026-11-08", "09:25:00"), "auction"),
+                 (at("2026-11-03", "09:24:59"), "auction"), (at("2026-11-03", "09:28:00"), "auction"),
+                 (at("2026-11-03", "09:25:00"), "opening"), (at("2026-11-03", "10:00:00"), "auction"),
+                 (at("2026-11-03", "09:29:59"), "opening"), (at("2026-11-03", "11:32:01"), "1132"),
+                 (at("2026-11-03", "11:45:00"), "lunch"), (at("2026-11-03", "12:00:00"), "lunch"),
+                 (at("2026-11-03", "12:59:59"), "1300"), (at("2026-11-03", "15:00:01"), "1500"),
+                 (at("2026-11-03", "10:00:00").replace(tzinfo=None), "1000"),
+                 (at("2026-11-03", "10:00:00").replace(tzinfo=timezone.utc), "1000")]
+        for now, slot in times:
+            with self.subTest(now=now, slot=slot):
+                with self.assertRaises(ValueError):
+                    self.r.monitor(self.quotes(now), {}, now, slot)
+                self.assertEqual(self.r.account(self.v), before)
+                self.assertEqual(self.counts(), counts)
+
+    def test_monitor_rejects_fresh_auction_and_lunch_quotes_for_intraday_execution(self):
+        self.planned_open(stop=10.5)
+        before = self.r.account(self.v)
+        for clock, quote_clock in (("09:30:00", "09:29:59"), ("11:31:00", "11:31:00"), ("13:00:00", "12:59:59")):
+            with self.subTest(clock=clock, quote_clock=quote_clock):
+                now = at("2026-11-03", clock)
+                quote = self.quote("600001", at("2026-11-03", quote_clock))
+                result = self.r.monitor({"600001": quote}, {}, now, clock)
+                self.assertEqual(result["decisions"][0]["action"], "defer")
+                self.assertTrue(any("非盘中报价" in text for text in result["decisions"][0]["reasons"]))
+                self.assertEqual(self.r.account(self.v), before)
+
+    def test_monitor_accepts_1130_quote_at_1132_and_afternoon_boundaries(self):
+        self.planned_open(stop=9)
+        now = at("2026-11-03", "11:32:00")
+        quote = self.quote("600001", at("2026-11-03", "11:30:00"))
+        self.assertEqual(self.r.monitor({"600001": quote}, {}, now, "1130")["decisions"][0]["action"], "hold")
+        for clock in ("13:00:00", "15:00:00"):
+            now = at("2026-11-03", clock)
+            result = self.r.monitor(self.quotes(now), {}, now, clock)
+            self.assertEqual(result["deferred"], 0)
+        self.assertFalse(self.r.account(self.v)["positions"])
+
+    def test_legacy_schema1_observes_intraday_and_settles_with_frozen_fees(self):
+        with patch.object(research, "RULES", research.LEGACY_RULES):
+            version, cfg = self.configure(slippage_pct=0.2, commission_min=7)
+            position = self.open_one(version=version)
+        frozen_spec = self.r.spec(version)
+        original = self.r.events(version)[0]
+        # Reproduce an actual schema1 event without new plan/remaining-shares fields.
+        r, old = self.book("actual_schema1")
+        spec = r.spec(old)
+        spec["rules"] = research.LEGACY_RULES
+        old_version = r.blob(research.encoded(spec))
+        legacy_open = {key: value for key, value in original.items()
+                       if key not in ("kind", "at", "version", "plan", "prev_close", "initial_shares", "remaining_shares")}
+        legacy_open["position_id"] = old_version + "/2026-11-02/600001"
+        with r.db:
+            r.db.execute("INSERT INTO versions VALUES (?,?,?)", (old_version, self.now.isoformat(), research.encoded(spec).decode()))
+            r.append("open/" + legacy_open["position_id"], old_version, "open", self.now, legacy_open)
+        for book, v in ((self.r, version), (r, old_version)):
+            before = book.account(v)
+            for clock, slot in (("09:25:00", "auction"), ("09:30:00", "opening"), ("14:51:00", "1451")):
+                now = at("2026-11-03", clock)
+                result = book.monitor(self.quotes(now, price=8), self.technical(11, 11), now, slot)
+                decision = next(d for d in result["decisions"] if d["version"] == v)
+                self.assertEqual(decision["action"], "observe")
+                self.assertTrue(any("schema1冻结" in text for text in decision["reasons"]))
+                self.assertEqual(book.account(v), before)
+            now = at("2026-11-03", "14:52:00")
+            settled = book.settle(self.quotes(now, price=11), now)
+            self.assertEqual(settled["closed"], 1)
+            self.assertEqual(settled["decisions"][0]["action"], "sell")
+            self.assertEqual(settled["decisions"][0]["version"], v)
+            trade = book.account(v)["closed"][0]
+            self.assertEqual(trade["version"], v)
+            self.assertEqual(trade["sell"], expected_execution(11, position["shares"], "sell", book.spec(v)["paper_config"]))
+        self.assertEqual(self.r.spec(version), frozen_spec)
+        self.assertEqual(self.r.events(version)[0], original)
+        self.assertEqual(frozen_spec["paper_config"], cfg)
+
+    def test_unknown_historical_rules_block_monitor_and_settle(self):
+        with patch.object(research, "RULES", {**research.RULES, "schema": 999}):
+            version = self.r.version(self.now)
+            self.open_one(version=version)
+        before = self.r.account(version)
+        now = at("2026-11-03", "10:00:00")
+        result = self.r.monitor(self.quotes(now), {}, now, "1000")
+        self.assertEqual(result["decisions"][0]["action"], "defer")
+        self.assertTrue(any("规则未知" in text for text in result["decisions"][0]["reasons"]))
+        final = at("2026-11-03", "14:51:00")
+        self.assertEqual(self.r.settle(self.quotes(final), final)["deferred"], 1)
+        self.assertEqual(self.r.account(version), before)
+
+    def test_week_and_month_details_filter_by_observation_and_sale_not_entry_date(self):
+        entry = at("2026-10-30")
+        self.planned_open(now=entry)
+        auction = at("2026-11-02", "09:25:00")
+        self.r.monitor(self.quotes(auction), {}, auction, "auction")
+        reduced = at("2026-11-02", "10:00:00")
+        self.r.monitor(self.quotes(reduced), self.technical(10.2, 10.1), reduced, "1000")
+        final = at("2026-11-02", "14:51:00")
+        self.r.settle(self.quotes(final, price=11), final)
+        week = self.r.report("week", final)
+        row = self.report_row(week, self.v)
+        self.assertEqual(row["period"]["n"], 0)
+        self.assertEqual(row["cumulative"]["n"], 1)
+        self.assertEqual(row["decision_count"], 3)
+        self.assertEqual(row["decision_action_counts"], {"hold": 0, "sell": 1, "reduce": 1, "defer": 0, "observe": 1})
+        self.assertEqual(row["sale_count"], 2)
+        self.assertTrue(all(s["sale_date"] == "2026-11-02" and s["entry_date"] == "2026-10-30" for s in row["sale_details"]))
+        self.assertIn("partial_sell", Path(week["text"]).read_text(encoding="utf-8"))
+        october = self.report_row(self.r.report("month", final), self.v)
+        self.assertEqual(october["period"]["n"], 1)
+        self.assertEqual(october["decision_details"], [])
+        self.assertEqual(october["sale_details"], [])
+        november = self.report_row(self.r.report("month", at("2026-12-01")), self.v)
+        self.assertEqual(november["period"]["n"], 0)
+        self.assertEqual(november["decision_count"], 3)
+        self.assertEqual(november["sale_count"], 2)
+        # Prior-week observations do not leak into the following week.
+        later = self.report_row(self.r.report("week", at("2026-11-09")), self.v)
+        self.assertEqual(later["decision_count"], 0)
+        self.assertEqual(later["sale_count"], 0)
+        self.assertEqual(week["data"]["decision_count"], 3)
+        self.assertEqual(week["data"]["sale_count"], 2)
+
+    def test_monitor_event_failure_rolls_back_decision_partial_cash_and_run(self):
+        self.planned_open()
+        before, counts = self.r.account(self.v), self.counts()
+        now = at("2026-11-03", "10:00:00")
+        with patch.object(self.r, "append", side_effect=self.fail_after_second_event(self.r)):
+            with self.assertRaisesRegex(RuntimeError, "injected event failure"):
+                self.r.monitor(self.quotes(now), self.technical(10.2, 10.1), now, "1000")
+        self.assertEqual(self.r.account(self.v), before)
+        self.assertEqual(self.counts(), counts)
+        self.assertEqual(self.r.monitor(self.quotes(now), self.technical(10.2, 10.1), now, "1000")["reduced"], 1)
+
+    def test_monitor_run_failure_rolls_back_events_and_new_calculation_version(self):
+        self.planned_open()
+        before, counts = self.r.account(self.v), self.counts()
+        # Change only the disposable fixture's config; calculation-version insertion must also roll back.
+        self.write_json(self.r.config_path, {**research.DEFAULT_CONFIG, "commission_min": 11})
+        now = at("2026-11-03", "10:00:00")
+        with patch.object(self.r, "finish_run", side_effect=RuntimeError("injected run failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected run failure"):
+                self.r.monitor(self.quotes(now), self.technical(10.2, 10.1), now, "1000")
+        self.assertEqual(self.r.account(self.v), before)
+        self.assertEqual(self.counts(), counts)
+        retry = self.r.monitor(self.quotes(now), self.technical(10.2, 10.1), now, "1000")
+        self.assertEqual(retry["reduced"], 1)
+        self.assertNotEqual(retry["decisions"][0]["decision_version"], self.v)
+        self.assertEqual(retry["decisions"][0]["version"], self.v)
+
+    def test_monitor_transaction_rolls_back_all_versions_when_run_fails(self):
+        self.planned_open()
+        newer, _ = self.configure(allocation=10000, commission_min=8)
+        self.planned_open(version=newer, now=at("2026-11-03"), code="600002")
+        before = {version: self.r.account(version) for version in (self.v, newer)}
+        counts = self.counts()
+        now = at("2026-11-04", "10:00:00")
+        quotes = self.quotes(now, ("600001", "600002"), price=8.5)
+        with patch.object(self.r, "finish_run", side_effect=RuntimeError("injected run failure")):
+            with self.assertRaisesRegex(RuntimeError, "injected run failure"):
+                self.r.monitor(quotes, {}, now, "1000")
+        self.assertEqual({version: self.r.account(version) for version in before}, before)
+        self.assertEqual(self.counts(), counts)
+        self.assertEqual(self.r.monitor(quotes, {}, now, "1000")["closed"], 2)
+
+    def test_force_failure_after_partial_rolls_back_final_cash_and_keeps_partial(self):
+        self.planned_open()
+        morning = at("2026-11-03", "10:00:00")
+        self.r.monitor(self.quotes(morning), self.technical(10.2, 10.1), morning, "1000")
+        before, counts = self.r.account(self.v), self.counts()
+        now = at("2026-11-03", "14:51:00")
+        with patch.object(self.r, "append", side_effect=self.fail_after_second_event(self.r)):
+            with self.assertRaisesRegex(RuntimeError, "injected event failure"):
+                self.r.settle(self.quotes(now, price=12), now)
+        self.assertEqual(self.r.account(self.v), before)
+        self.assertEqual(self.counts(), counts)
+        self.assertEqual(self.r.settle(self.quotes(now, price=12), now)["closed"], 1)
+
+    def test_settle_returns_individual_decisions_for_notifications(self):
+        self.planned_open()
+        now = at("2026-11-03", "14:51:00")
+        result = self.r.settle(self.quotes(now, price=11), now)
+        self.assertEqual(len(result["decisions"]), 1)
+        self.assertEqual(result["decisions"][0]["code"], "600001")
+        self.assertEqual(result["decisions"][0]["action"], "sell")
+        self.assertEqual(result["decisions"][0]["remaining_shares"], 0)
+        self.assertEqual(self.r.events(self.v)[-2]["kind"], "decision")
+
+    def test_partial_then_close_gross_return_uses_weighted_quote_prices(self):
+        position = self.planned_open()
+        morning = at("2026-11-03", "10:00:00")
+        first = self.r.monitor(self.quotes(morning), self.technical(ma5=11, vwap=11), morning, "1000")
+        self.assertEqual(first["reduced"], 1)
+        sold = first["decisions"][0]["sell_shares"]
+        self.r.settle(self.quotes(at("2026-11-03", "14:51:00"), price=12), at("2026-11-03", "14:51:00"))
+        trade = self.r.account(self.v)["closed"][0]
+        weighted = (10 * sold + 12 * (position["shares"] - sold)) / position["shares"]
+        self.assertAlmostEqual(trade["gross_pct"], (weighted / position["entry_quote"] - 1) * 100)
+        self.assertNotAlmostEqual(trade["gross_pct"], 20)
 
 
 if __name__ == "__main__":

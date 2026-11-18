@@ -35,8 +35,9 @@ class Job:
 
 
 JOBS = (
+    Job("auction", "09:25", SHORT, "auction"),
     *(Job("exit_" + at.replace(":", ""), at, SHORT, "exit") for at in
-      ("09:35", "10:00", "10:30", "11:00", "11:31", "13:05", "13:30", "14:00", "14:30")),
+      ("09:30", "09:35", "10:00", "10:30", "11:00", "11:30", "13:00", "13:05", "13:30", "14:00", "14:30")),
     Job("scan", "14:31", SHORT, "scan"),
     Job("paper_settle", "14:51", SHORT, "paper_settle"),
     Job("pm", "14:51", SHORT, "pm"),
@@ -59,16 +60,14 @@ def read(path, default):
 
 
 def due(now, completed):
-    if now.weekday() >= 5:
-        return []
-    first = now.date().replace(day=1)
-    while first.weekday() >= 5:
-        first += timedelta(days=1)
     result = []
     for job in JOBS:
-        if job.period == "week" and now.weekday() != 4:
+        if job.period == "month":
+            if now.day != 1:
+                continue
+        elif now.weekday() >= 5:
             continue
-        if job.period == "month" and now.date() != first:
+        if job.period == "week" and now.weekday() != 4:
             continue
         hour, minute = map(int, job.at.split(":"))
         lateness = (now - now.replace(hour=hour, minute=minute, second=0, microsecond=0)).total_seconds()
@@ -186,7 +185,7 @@ class Bot:
         return datetime.now(CST)
 
     def command(self, job, now):
-        if job.mode in ("paper_settle", "week", "month"):
+        if job.mode in ("auction", "exit", "paper_settle", "week", "month"):
             return [sys.executable, "-X", "utf8", str(self.home / "bot.py"), "--run", job.name]
         return [sys.executable, "-X", "utf8", str(self.runtime / SHORT / "scripts" / "tail_momentum.py"),
                 "--mode", job.mode, "--no-push", "--no-hold", "--force-now", now.strftime("%Y-%m-%d %H:%M")]
@@ -209,6 +208,73 @@ class Bot:
     def quotes(self, codes):
         return self.market_module().tencent_quotes(codes) if codes else {}
 
+    def exit_indicators(self, codes, now):
+        if not codes or now.strftime("%H%M") < "0940":
+            return {}
+        worker = (
+            "import contextlib,json,sys; from datetime import datetime; from bot import Bot; "
+            "request=json.load(sys.stdin); "
+            "\nwith contextlib.redirect_stdout(sys.stderr):\n"
+            " result=Bot(request['home']).collect_exit_indicators(request['codes'],datetime.fromisoformat(request['now']))\n"
+            "print(json.dumps(result,ensure_ascii=False,allow_nan=False))"
+        )
+        try:
+            completed = subprocess.run([sys.executable, "-X", "utf8", "-c", worker],
+                                       input=json.dumps({"home": str(self.home), "codes": codes, "now": now.isoformat()}),
+                                       cwd=str(Path(__file__).resolve().parent), capture_output=True, text=True,
+                                       encoding="utf-8", timeout=35, check=True)
+            return json.loads(completed.stdout)
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError, OSError):
+            return {code: {"data_missing": True, "err": "技术指标超时或不可用，仅按有效价格规则判断"} for code in codes}
+
+    def collect_exit_indicators(self, codes, now):
+        engine = self.market_module()
+        result = {}
+        for code in codes:
+            try:
+                bars, source, status, _, notes = engine.fetch_5m(code, now, now.date().isoformat(), lmt=200)
+                if isinstance(status, str) and status.lstrip().startswith("\u274c"):
+                    result[code] = {"data_missing": True, "err": "5分钟K线校验失败，禁用技术指标"}
+                    continue
+                closed = engine.build_10m(bars, now)
+                today = [bar for bar in closed if bar["t"][:10] == now.date().isoformat()]
+                if not today or now.replace(tzinfo=None) - datetime.strptime(today[-1]["t"], "%Y-%m-%d %H:%M") > timedelta(minutes=15):
+                    result[code] = {"data_missing": True, "err": "当日已完成10分钟K线缺失或过期"}
+                    continue
+                amount = sum(bar.get("amt", 0) for bar in today)
+                volume = sum(bar["v"] for bar in today)
+                cfg = read(self.runtime / SHORT / "config.json", {})
+                estimated = any(bar.get("amt_est") for bar in bars)
+                result[code] = {"ma5_last": engine.ma([bar["c"] for bar in closed], int(cfg.get("ma10m_period", 5))),
+                                "vwap": amount / (volume * 100) if amount and volume and not estimated else None,
+                                "source": source, "notes": notes, "last_bar": today[-1]["t"], "data_missing": False}
+                if estimated:
+                    result[code]["err"] = "成交额为估算值，禁用VWAP规则"
+            except (ValueError, TypeError, KeyError, OSError):
+                result[code] = {"data_missing": True, "err": "技术指标读取失败，仅评估有效价格规则"}
+        return result
+
+    def paper_report(self, job, now, result):
+        actions = {"hold": "持有", "sell": "全部卖出", "reduce": "减仓", "defer": "无法模拟成交", "observe": "仅观察"}
+        lines = [f"独立模拟持仓判断 · {now:%Y-%m-%d %H:%M} · {job.name}",
+                 "非实盘，不向券商下单；模拟成交使用新鲜报价加不利滑点，不保证真实成交。", ""]
+        for item in result.get("decisions", []):
+            lines += [f"{item['code']} {item.get('name', '')} | {actions.get(item['action'], item['action'])} | 现价 {item.get('price', '缺失')}",
+                      f"模拟卖出 {item.get('sell_shares', 0)} 股；剩余 {item.get('remaining_shares', item.get('shares_before', 0))} 股；情景 {item.get('scenario', '不可判定')}",
+                      "；".join(item.get("reasons", [])), f"入场版本 {item.get('version', '')[:12]}", ""]
+        lines += [f"本次模拟平仓 {result.get('closed', 0)} 笔，减仓 {result.get('reduced', 0)} 笔，延期 {result.get('deferred', 0)} 笔。",
+                  "当前独立模拟持仓（按入场版本保留，不与空的原引擎账本混淆）："]
+        held = []
+        with self.research() as store:
+            for (version,) in store.db.execute("SELECT id FROM versions"):
+                for position in store.account(version)["positions"].values():
+                    held.append(f"{position['code']} {position['name']} | {position['remaining_shares']} 股 | 建仓 {position['entry_date']} | 版本 {version[:12]}")
+        lines.extend(held or ["无模拟持仓"])
+        path = self.home / "research" / "reports" / f"持仓判断_{now:%Y-%m-%d}_{job.name}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return str(path)
+
     def archive_runtime(self, job, now):
         if job.mode == "status":
             return
@@ -223,7 +289,7 @@ class Bot:
         if (job.system == SHORT and job.mode not in ("paper_settle", "week", "month")
                 and read(self.runtime / SHORT / "positions.json", {}).get("positions")):
             raise RuntimeError("仅报告模式禁止处理非空持仓；请人工核验隔离账本。")
-        if job.mode in ("week", "month"):
+        if job.mode in ("week", "month", "auction", "exit"):
             return
         if not fresh(self.market_env(), now, max_age=900 if job.mode == "ksnap" else 300):
             raise RuntimeError("无当日完整、新鲜指数行情；跳过任务，不以缺失时间戳放行。")
@@ -241,16 +307,20 @@ class Bot:
                 raise RuntimeError("候选包含校验异常，禁止尾盘确认。")
 
     def report_path(self, job, now):
-        if job.mode in ("week", "month"):
-            result = read(self.state_file, {"jobs": {}})["jobs"].get(f"{now:%Y-%m-%d}/{job.name}", {})
-            if result.get("research_report"):
-                return Path(result["research_report"])
+        result = read(self.state_file, {"jobs": {}})["jobs"].get(f"{now:%Y-%m-%d}/{job.name}", {})
+        if result.get("research_report"):
+            return Path(result["research_report"])
+        if job.mode in ("auction", "exit", "paper_settle"):
+            return None
         names = {"scan": f"尾盘选股_{now:%Y-%m-%d}.md", "pm": f"买入清单_{now:%Y-%m-%d}.md",
                  "week": "最新周总结.md", "month": "最新月总结.md"}
         name = names.get(job.mode)
         return self.runtime / SHORT / "报告" / name if name else None
 
     def notify(self, job, now, started_ns):
+        result = read(self.state_file, {"jobs": {}})["jobs"].get(f"{now:%Y-%m-%d}/{job.name}", {})
+        if result.get("report_error"):
+            return {"status": "failed", "error": "模拟判断已记录，但本次报告生成失败；不发送旧报告"}
         report = self.report_path(job, now)
         if report is None:
             return {"status": "not_applicable"}
@@ -302,6 +372,7 @@ class Bot:
         dump(self.state_file, state)
         started_ns = time.time_ns()
         version = None
+        result = {"status": "failed", "at": now.isoformat()}
         try:
             self.archive_runtime(job, now)
             self.guard(job, now, state)
@@ -312,10 +383,25 @@ class Bot:
                 with self.research() as store:
                     version = store.version(now)
                 result["research_version"] = version
-            if job.mode == "paper_settle":
+            if job.mode in ("auction", "exit", "paper_settle"):
                 with self.research() as store:
-                    quotes = self.quotes(store.open_codes())
-                    result["paper"] = store.settle(quotes, self.clock())
+                    codes = store.open_codes()
+                indicators = self.exit_indicators(codes, now) if job.mode == "exit" else {}
+                quotes = self.quotes(codes)
+                observed = self.clock()
+                for code, indicator in indicators.items():
+                    if indicator.get("last_bar"):
+                        stamp = datetime.strptime(indicator["last_bar"], "%Y-%m-%d %H:%M").replace(tzinfo=CST)
+                        if not 0 <= (observed - stamp).total_seconds() <= 900:
+                            indicators[code] = {"data_missing": True, "err": "实际观察时指标已过期，禁用技术规则"}
+                with self.research() as store:
+                    if job.mode == "paper_settle":
+                        result["paper"] = store.settle(quotes, observed)
+                    else:
+                        result["paper"] = store.monitor(quotes, indicators, observed, job.name)
+                state["jobs"][key] = result
+                dump(self.state_file, state)
+                result["research_report"] = self.paper_report(job, now, result["paper"])
                 log_file.write_text(json.dumps(result["paper"], ensure_ascii=False, indent=2), encoding="utf-8")
             elif job.mode in ("week", "month"):
                 with self.research() as store:
@@ -350,8 +436,25 @@ class Bot:
                     if version != store.version(self.clock()):
                         raise RuntimeError("执行期间版本变化，不登记模拟样本。")
                     result["paper"] = store.enter(version, signal, quotes, self.clock())
+                state["jobs"][key] = result
+                dump(self.state_file, state)
+                result["research_report"] = self.paper_report(job, now, result["paper"])
+                summary = Path(result["research_report"])
+                with summary.open("a", encoding="utf-8") as output:
+                    output.write(f"\n\n本次模拟建仓 {result['paper']['opened']} 笔，跳过 {result['paper']['skipped']} 个信号。\n")
+                    with self.research() as store:
+                        for event in store.events(version):
+                            if event["kind"] == "skip" and event["entry_date"] == now.date().isoformat():
+                                output.write(f"{event['code']} 未模拟建仓：{event['reason']}\n")
+                    source_report = self.runtime / SHORT / "报告" / f"买入清单_{now:%Y-%m-%d}.md"
+                    if source_report.is_file() and source_report.stat().st_mtime_ns >= started_ns:
+                        output.write("\n候选分析原文（原引擎已购买清单不作为模拟账本，以本报告上方持仓为准）：\n")
+                        output.write(source_report.read_text(encoding="utf-8"))
         except Exception as error:
-            result = {"status": "failed", "at": now.isoformat(), "error": str(error), "research_version": version}
+            if "paper" in result:
+                result["report_error"] = str(error)
+            else:
+                result = {"status": "failed", "at": now.isoformat(), "error": str(error), "research_version": version}
         try:
             self.archive_runtime(job, self.clock())
         except Exception as error:

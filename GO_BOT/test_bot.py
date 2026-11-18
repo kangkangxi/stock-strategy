@@ -25,10 +25,24 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(due(datetime(2026, 11, 14, 14, 31, tzinfo=CST), {}), [])
 
     def test_week_and_month(self):
-        monday = datetime(2026, 11, 2, 15, 5, tzinfo=CST)
-        self.assertEqual([j.name for j in due(monday, {})], ["month"])
-        self.assertNotIn("month", [j.name for j in due(monday + timedelta(days=1), {})])
+        sunday = datetime(2026, 11, 1, 15, 5, tzinfo=CST)
+        self.assertEqual([j.name for j in due(sunday, {})], ["month"])
+        self.assertNotIn("month", [j.name for j in due(sunday + timedelta(days=1), {})])
         self.assertIn("week", [j.name for j in due(datetime(2026, 11, 13, 15, 5, tzinfo=CST), {})])
+        friday = datetime(2027, 1, 1, 15, 5, tzinfo=CST)
+        self.assertEqual([j.name for j in due(friday, {})], ["week", "month"])
+
+    def test_auction_open_and_half_hour_schedule(self):
+        slots = {job.at: job.name for job in JOBS if job.mode in ("auction", "exit")}
+        self.assertEqual(slots["09:25"], "auction")
+        for clock in ("09:30", "10:00", "10:30", "11:00", "11:30", "13:00", "13:30", "14:00", "14:30"):
+            self.assertIn(clock, slots)
+        self.assertNotIn("11:31", slots)
+        self.assertNotIn("12:00", slots)
+        for hour, minute in ((9, 25), (9, 30)):
+            at = datetime(2026, 11, 19, hour, minute, tzinfo=CST)
+            self.assertEqual(len(due(at, {})), 1)
+            self.assertEqual(due(at.replace(day=21), {}), [])
 
     def test_market_freshness(self):
         at = datetime(2026, 11, 16, 14, 31, tzinfo=CST)
@@ -104,7 +118,7 @@ class BotTests(unittest.TestCase):
     def test_safe_command(self):
         for job in JOBS:
             command = self.bot.command(job, self.now)
-            if job.mode in ("paper_settle", "week", "month"):
+            if job.mode in ("auction", "exit", "paper_settle", "week", "month"):
                 self.assertEqual(command[3], str(self.home / "bot.py"))
                 self.assertEqual(command[-2:], ["--run", job.name])
                 continue
@@ -387,6 +401,138 @@ class BotTests(unittest.TestCase):
         path = self.bot.report_path(job, self.now)
         self.assertIn(str(self.home / "research" / "reports"), str(path))
         self.assertIn("独立虚拟账户", path.read_text(encoding="utf-8"))
+
+    def test_exit_calls_independent_monitor_and_notifies_current_report(self):
+        at = self.now.replace(hour=10, minute=0)
+        job = next(j for j in JOBS if j.name == "exit_1000")
+        decision = {"code": "600000", "name": "测试", "action": "reduce", "price": 10.5,
+                    "sell_shares": 500, "remaining_shares": 500, "scenario": "C", "reasons": ["冲高回落"], "version": "fixture"}
+        with patch("bot.Research.monitor", return_value={"decisions": [decision], "closed": 0, "reduced": 1, "deferred": 0}) as monitor, \
+                patch.object(self.bot, "clock", return_value=at), patch.object(self.bot, "quotes", return_value={}), \
+                patch.object(self.bot, "exit_indicators", return_value={}), patch("bot.subprocess.run") as execute, \
+                patch.object(self.bot, "notify", return_value={"status": "sent"}):
+            self.assertEqual(self.bot.run(at, job), 0)
+            monitor.assert_called_once_with({}, {}, at, "exit_1000")
+            execute.assert_not_called()
+        result = read(self.bot.state_file, {})["jobs"]["2026-11-16/exit_1000"]
+        path = self.bot.report_path(job, at)
+        self.assertEqual(result["notification"]["status"], "sent")
+        self.assertIn("减仓", path.read_text(encoding="utf-8"))
+        self.assertIn("500 股", path.read_text(encoding="utf-8"))
+        self.assertEqual(read(self.bot.runtime / SHORT / "positions.json", {})["positions"], [])
+        with patch("bot.Research.monitor") as replay:
+            self.assertEqual(self.bot.run(at, job), 0)
+            replay.assert_not_called()
+
+    def test_auction_does_not_require_index_or_technical_data(self):
+        at = self.now.replace(hour=9, minute=25)
+        job = next(j for j in JOBS if j.name == "auction")
+        with patch("bot.Research.monitor", return_value={"decisions": [], "closed": 0, "reduced": 0, "deferred": 0}) as monitor, \
+                patch.object(self.bot, "clock", return_value=at), patch.object(self.bot, "quotes", return_value={}), \
+                patch.object(self.bot, "exit_indicators") as indicators, patch.object(self.bot, "market_env") as market:
+            self.assertEqual(self.bot.run(at, job), 0)
+            monitor.assert_called_once_with({}, {}, at, "auction")
+            market.assert_not_called()
+            indicators.assert_not_called()
+        result = read(self.bot.state_file, {})["jobs"]["2026-11-16/auction"]
+        self.assertEqual(result["notification"]["status"], "disabled")
+
+    def test_month_report_runs_on_weekend_without_market_data(self):
+        at = datetime(2026, 11, 1, 15, 5, tzinfo=CST)
+        job = next(j for j in JOBS if j.name == "month")
+        with patch.object(self.bot, "clock", return_value=at), patch.object(self.bot, "market_env") as market:
+            self.assertEqual(self.bot.run(at), 0)
+            market.assert_not_called()
+        text = self.bot.report_path(job, at).read_text(encoding="utf-8")
+        self.assertIn("2026-10-01", text)
+        self.assertIn("2026-10-31", text)
+
+    def test_exit_technical_data_is_closed_and_current(self):
+        at = self.now.replace(hour=10, minute=0)
+        engine = unittest.mock.Mock()
+        engine.fetch_5m.return_value = ([{"fixture": True}], "fixture", None, [], [])
+        engine.build_10m.return_value = [{"t": "2026-11-16 10:00", "c": 10, "v": 100, "amt": 100000}]
+        engine.ma.return_value = 10
+        with patch.object(self.bot, "market_module", return_value=engine):
+            data = self.bot.collect_exit_indicators(["600000"], at)
+            self.assertEqual(data["600000"]["vwap"], 10)
+            engine.build_10m.assert_called_once_with([{"fixture": True}], at)
+            engine.build_10m.return_value = [{"t": "2026-11-16 09:40", "c": 10, "v": 100, "amt": 100000}]
+            self.assertTrue(self.bot.collect_exit_indicators(["600000"], at)["600000"]["data_missing"])
+        with patch.object(self.bot, "market_module") as market:
+            self.assertEqual(self.bot.exit_indicators(["600000"], at.replace(hour=9, minute=30)), {})
+            market.assert_not_called()
+
+    def test_invalid_or_estimated_technical_data_does_not_drive_vwap(self):
+        at = self.now.replace(hour=10, minute=0)
+        engine = unittest.mock.Mock()
+        engine.fetch_5m.return_value = ([{"amt_est": True}], "fixture", "\u274c K线错误", [], [])
+        with patch.object(self.bot, "market_module", return_value=engine):
+            self.assertTrue(self.bot.collect_exit_indicators(["600000"], at)["600000"]["data_missing"])
+            engine.build_10m.assert_not_called()
+            engine.fetch_5m.return_value = ([{"amt_est": True}], "fixture", "ok", [], [])
+            engine.build_10m.return_value = [{"t": "2026-11-16 10:00", "c": 10, "v": 100, "amt": 100000}]
+            engine.ma.return_value = 10
+            self.assertIsNone(self.bot.collect_exit_indicators(["600000"], at)["600000"]["vwap"])
+
+    def test_paper_report_shows_remaining_holdings_after_reduction(self):
+        entry = self.now.replace(minute=51)
+        quote = {"code": "600000", "price": 10, "open": 10, "prev_close": 10, "vol": 1000,
+                 "limit_up": 11, "limit_down": 9, "time": entry.strftime("%Y%m%d%H%M%S")}
+        signal = {"date": entry.date().isoformat(), "generated": entry.strftime("%Y-%m-%d %H:%M"),
+                  "confirmed": [{"code": "600000", "name": "测试", "data_ok": True, "price": 10, "plan": {"stop": 9}}]}
+        later = entry.replace(day=17, hour=10, minute=0)
+        with self.bot.research() as store:
+            version = store.version(entry)
+            store.enter(version, signal, {"600000": quote}, entry)
+            paper = store.monitor({"600000": {**quote, "time": later.strftime("%Y%m%d%H%M%S")}},
+                                  {"600000": {"ma5_last": 11, "vwap": 11}}, later, "exit_1000")
+        self.assertEqual(paper["reduced"], 1)
+        job = next(j for j in JOBS if j.name == "exit_1000")
+        text = Path(self.bot.paper_report(job, later, paper)).read_text(encoding="utf-8")
+        self.assertIn("600000 测试 | 1000 股", text)
+        self.assertNotIn("600000 测试 | 1900 股", text)
+
+    def test_indicator_worker_offline_integration(self):
+        at = self.now.replace(hour=10, minute=0)
+        script = self.bot.runtime / SHORT / "scripts" / "tail_momentum.py"
+        script.write_text(
+            "def fetch_5m(code, now, today, lmt):\n"
+            " print('fixture diagnostic')\n"
+            " return [{'t': today+' 10:00', 'c': 10, 'v': 100, 'amt': 100000}], 'fixture', 'ok', [], []\n"
+            "def build_10m(bars, now):\n return bars\n"
+            "def ma(values, period):\n return 10\n", encoding="utf-8")
+        data = self.bot.exit_indicators(["600000"], at)
+        self.assertFalse(data["600000"]["data_missing"])
+        self.assertEqual(data["600000"]["ma5_last"], 10)
+        self.assertEqual(data["600000"]["vwap"], 10)
+        self.assertEqual(data["600000"]["source"], "fixture")
+
+    def test_technical_fetch_has_total_deadline(self):
+        at = self.now.replace(hour=10, minute=0)
+        with patch("bot.subprocess.run", side_effect=subprocess.TimeoutExpired("fixture", 35)) as worker:
+            data = self.bot.exit_indicators(["600000", "600001"], at)
+            self.assertTrue(all(item["data_missing"] for item in data.values()))
+            self.assertEqual(worker.call_args.kwargs["timeout"], 35)
+            self.assertTrue(worker.call_args.kwargs["check"])
+
+    def test_report_failure_preserves_committed_decisions_and_never_sends_old_report(self):
+        at = self.now.replace(hour=10, minute=0)
+        job = next(j for j in JOBS if j.name == "exit_1000")
+        paper = {"decisions": [{"code": "600000", "action": "reduce"}], "closed": 0, "reduced": 1, "deferred": 0}
+        with patch("bot.Research.monitor", return_value=paper) as monitor, patch.object(self.bot, "clock", return_value=at), \
+                patch.object(self.bot, "quotes", return_value={}), patch.object(self.bot, "exit_indicators", return_value={}), \
+                patch.object(self.bot, "paper_report", side_effect=OSError("fixture disk failure")), \
+                patch("bot.urllib.request.urlopen") as request:
+            self.assertEqual(self.bot.run(at, job), 1)
+            request.assert_not_called()
+            result = read(self.bot.state_file, {})["jobs"]["2026-11-16/exit_1000"]
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["paper"], paper)
+            self.assertEqual(result["notification"]["status"], "failed")
+            self.assertIn("report_error", result)
+            self.assertEqual(self.bot.run(at, job), 1)
+            monitor.assert_called_once()
 
 
 if __name__ == "__main__":
